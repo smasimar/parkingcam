@@ -105,10 +105,10 @@ def save_debug_image(roi, detections):
 def connect_to_rtsp_stream(rtsp_url):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        debug_log(f"Failed to connect to the RTSP stream at {rtsp_url}")
+        debug_log(f"Failed to connect to {rtsp_url}")
         return None
     else:
-        debug_log(f"Successfully connected to the RTSP stream at {rtsp_url}")
+        debug_log(f"Successfully connected to {rtsp_url}")
     return cap
 
 # Argument parser to handle the --debug flag
@@ -229,7 +229,7 @@ while True:
 
         history=''
         for i, car in enumerate(car_history):
-            record = '☑' if car else '☒'
+            record = '✔️' if car else '❌'
             history = f'{history}{record} '
 
         # If in debug mode, log information and save the image with visual output
