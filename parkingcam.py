@@ -133,7 +133,7 @@ rtsp_password = os.getenv('RTSP_PASSWORD')
 rtsp_address = os.getenv('RTSP_ADDRESS')
 
 # Construct the RTSP URL
-rtsp_url = f"rtsp://{rtsp_username}:{rtsp_password}@{rtsp_adress}"
+rtsp_url = f"rtsp://{rtsp_username}:{rtsp_password}@{rtsp_address}"
 
 # Initial connection to the RTSP stream
 cap = connect_to_rtsp_stream(rtsp_url)
