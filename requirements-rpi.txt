@@ -1,0 +1,12 @@
+colorzero==2.0
+gpiozero==2.0.1
+lgpio==0.2.2.0
+numpy==2.1.2
+opencv-python==4.10.0.84
+pigpio==1.78
+pillow==10.4.0
+pystray==0.19.5
+python-dotenv==1.0.1
+python-xlib==0.33
+six==1.16.0
+spidev==3.6
