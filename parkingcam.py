@@ -1,16 +1,33 @@
 import os
+import sys
 import cv2
 import time
+import logging
+import platform
 import argparse
 import subprocess
 import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
-from pystray import Icon, MenuItem, Menu
 from PIL import Image, ImageDraw, ImageFont
 
+# Checking if running on Windows or RPi
+is_windows = platform.system() == "Windows"
+
+####################################################################################################
+# Windows system tray-related function definitions
+####################################################################################################
+
+# Only load pystray on Windows to prevent RPi issues
+if is_windows:
+    from pystray import Icon, MenuItem, Menu
+
 # Function to create and manage the system tray icon
-def create_icon():
+def icon_init():
+    # Do not initialize if not needed
+    if args.notray:
+        return None
+
     # Create a pystray Icon instance
     icon = Icon("Parking Spot Monitor")
     icon.title = "Parking Spot Monitor"
@@ -25,8 +42,7 @@ def create_icon():
     )
 
     # Run the icon
-    if not args.notray:
-        icon.run_detached()
+    icon.run_detached()
 
     return icon
 
@@ -37,25 +53,196 @@ def open_vlc():
 
 # Function to change the taskbar icon based on parking status
 def update_icon_state(icon, state):
+    if icon is None:
+        return
+
     if state == "taken":
         icon.icon = Image.open("assets/car_red.ico")
     else:
         icon.icon = Image.open("assets/car_green.ico")
 
+####################################################################################################
+# RPi SPI display-related function definitions
+####################################################################################################
+
+if not is_windows:
+    import spidev as SPI
+    sys.path.append("..")
+    from lib import LCD_1inch69
+
+def display_init():
+    try:
+        log.debug('Start display initialization')
+        # Display with hardware SPI:
+        # Warning!!!Don't create multiple display objects!!!
+        # disp = LCD_1inch69.LCD_1inch69(spi=SPI.SpiDev(bus, device),spi_freq=10000000,rst=RST,dc=DC,bl=BL)
+        RST = 27
+        DC = 25
+        BL = 18
+        bus = 0 
+        device = 0
+        disp = LCD_1inch69.LCD_1inch69()
+        # Initialize library
+        disp.Init()
+        # Clear display
+        disp.clear()
+        # Set the backlight
+        disp.bl_DutyCycle(10)
+        log.debug('Finish display initialization')
+
+    except IOError as e:
+        log.error(e)    
+
+    return disp
+
+def display_draw_status(disp, car_history, car_image):
+    font = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 64)
+    canvas = Image.new("RGB", (disp.width,disp.height), (255, 0, 255))
+    width, height = car_image.size
+    size=(240, 240)
+    
+    # Determine if the image is portrait or landscape
+    if height > width:  # Portrait
+        # Crop a square from the bottom
+        new_height = width
+        left = 0
+        top = height - width  # Bottom crop
+        right = width
+        bottom = height
+    else:  # Landscape or square
+        # Crop a square from the center
+        new_width = height
+        left = (width - height) // 2  # Center crop
+        top = 0
+        right = left + height
+        bottom = height
+
+    # Crop the image
+    car_image = car_image.crop((left, top, right, bottom))
+    # Resize the cropped image to 240x240
+    car_image = car_image.resize(size)
+
+    # Statusbar size = 240x40
+    # Statusbar entry size = 24x40
+    canvas.paste(car_image, (0, 40))
+
+    draw = ImageDraw.Draw(canvas)
+    for i, car_present in enumerate(car_history):
+        if car_present:
+            draw.rectangle([(i*24, 0), ((i+1)*24, 40)], fill = "GREEN", outline="BLACK")
+        else:
+            draw.rectangle([(i*24, 0), ((i+1)*24, 40)], fill = "RED", outline="BLACK")
+
+    if args.clock:
+        statustext_time = datetime.now().strftime('%H:%M')
+        draw_text_with_background(
+            img=canvas,
+            text=statustext_time,
+            font=font,
+            position=(120, 45),  # Position of the text (center of the text will be at (250, 250))
+            alignment='center',  # Alignment options: 'center', 'left', 'right'
+            text_color='white',  # Color of the text
+            bg_color=(127, 0, 127)  # Background color 
+        )
+
+    disp.ShowImage(canvas.rotate(180))
+
+def draw_text_with_background(img, text, font, position, alignment='center', text_color='black', bg_color='yellow'):
+    draw = ImageDraw.Draw(img)
+
+    # Get the size of the text (bounding box)
+    text_bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+
+    # Calculate the position based on the alignment
+    x, y = position
+
+    if alignment == 'center':
+        x -= text_width // 2
+    elif alignment == 'right':
+        x -= text_width
+    # If alignment is 'left', we don't need to adjust x
+
+    # Draw a rectangle behind the text (background)
+    padding = 10  # Padding around the text
+    draw.rectangle(
+        [x - padding, y, x + text_width + padding, y + text_height + padding*2],
+        fill=bg_color
+    )
+
+    # Draw the text on top of the rectangle
+    draw.text((x, y), text, font=font, fill=text_color)
+
+    return img
+
+def display_exit(disp):
+    disp.module_exit()
+
+def display_test(disp):
+    Font1 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 25)
+    Font2 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 35)
+    Font3 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 32)
+
+    log.debug('Create blank image for drawing.')
+    image1 = Image.new("RGB", (disp.width,disp.height ), (127, 127, 127))
+    draw = ImageDraw.Draw(image1)
+
+    draw.rectangle((25, 10, 26, 11), fill = "BLACK")
+    draw.rectangle((25, 25, 27, 27), fill = "BLACK")
+    draw.rectangle((25, 40, 28, 43), fill = "BLACK")
+    draw.rectangle((25, 55, 29, 59), fill = "BLACK")
+    
+    draw.rectangle([(40, 10), (90, 60)], fill = "WHITE", outline="BLUE")
+    draw.rectangle([(105, 10), (150, 60)], fill = "BLUE")
+    
+    draw.line([(40, 10), (90, 60)], fill = "RED", width = 1)
+    draw.line([(90, 10), (40, 60)], fill = "RED", width = 1)
+    draw.line([(130, 65), (130, 115)], fill = "RED", width = 1)
+    draw.line([(105, 90), (155, 90)], fill = "RED", width = 1)
+    
+    draw.arc((105, 65, 155, 115), 0, 360, fill =(0, 255, 0))
+    draw.ellipse((40, 65, 90, 115), fill = (0, 255, 0))
+    
+    draw.rectangle([(20, 120), (160, 153)], fill = "BLUE")
+    draw.text((25, 120), 'Hello world', fill = "RED", font=Font1)
+    draw.rectangle([(20,155), (192, 195)], fill = "RED")
+    draw.text((21, 155), 'WaveShare', fill = "WHITE", font=Font2)
+    draw.text((25, 190), '1234567890', fill = "GREEN", font=Font3)
+    
+    image1 = image1.rotate(180)
+    disp.ShowImage(image1)
+
+####################################################################################################
+# Misc logging functionality
+####################################################################################################
+
 # Function to log car activity (arrival and departure)
 def log_car_activity(action, timestamp):
     log_entry=f'{timestamp} :: {action}'
-    debug_log(log_entry)
-    with open('car_log.txt', 'a') as log_file:
+    log.debug(log_entry)
+    with open('car.log', 'a') as log_file:
         log_file.write(f'{log_entry}\n')
 
-# Function to output debug logs
-def debug_log(message):
-    if args.debug:
-        print(message)
+def draw_statusbar(car_history, debug_image):
+    
+    if not is_windows:
+        display_draw_status(display, car_history, debug_image)
+
+    statusbar = ''
+    for i, car_present in enumerate(car_history):
+        statusbar = f'{statusbar}✔️ ' if car_present else f'{statusbar}❌ '
+    log.debug(statusbar)
+
+    return None
 
 # Function to save an image with bounding boxes and class_id in debug mode
-def save_debug_image(roi, detections):
+def draw_debug_image(roi, detections):
+
+    # Initiate font for debug image output
+    font_size = 24
+    font = ImageFont.truetype("assets/RobotoMonoMedium.ttf", font_size)
+
     class_names = {0:'background', 1:'aeroplane', 2: 'bicycle', 3: 'bird', 4: 'boat',
                     5: 'bottle', 6: 'bus', 7: 'car', 8: 'cat', 9: 'chair', 10: 'cow', 
                     11: 'diningtable', 12: 'dog', 13: 'horse', 14: 'motorbike', 15: 'person', 
@@ -94,32 +281,49 @@ def save_debug_image(roi, detections):
             draw.text((startX, startY), label, font=font, fill=class_color)
             
             # Convert PIL image back to OpenCV image
-            roi = np.array(image_pil) 
-        
-    # Save the debug image
-    debug_image_path = f"debug/debug_output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
-    cv2.imwrite(debug_image_path, roi)
-    debug_log(f"Debug image saved: {debug_image_path}")
+            # roi = np.array(image_pil)  
+
+    return image_pil
 
 # Function to connect/reconnect to the RTSP stream
 def connect_to_rtsp_stream(rtsp_url):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        debug_log(f"Failed to connect to {rtsp_url}")
+        log.error(f"Failed to connect to {rtsp_url}")
         return None
     else:
-        debug_log(f"Successfully connected to {rtsp_url}")
+        log.info(f"Successfully connected to {rtsp_url}")
     return cap
+
+####################################################################################################
+####################################################################################################
+####################################################################################################
 
 # Argument parser to handle the --debug flag
 parser = argparse.ArgumentParser(description="Car detection script.")
-parser.add_argument("--debug", action="store_true", help="Enable debug mode for detailed logging.")
+parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
 parser.add_argument("--image", action="store_true", help="Enable debug image output.")
-parser.add_argument("--notray", action="store_true", help="Disable tray icon.")
+parser.add_argument("--notray", action="store_true", help="Disable Windows tray icon.")
+parser.add_argument("--clock",action="store_true", help="Display clock on the SPI Display")
 args = parser.parse_args()
 
-# Create system tray icon
-icon = create_icon()
+if args.debug:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(levelname)s: %(message)s'
+    )
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s: %(message)s'
+    )
+log = logging.getLogger(__name__)
+
+# Initialize system tray icon
+if is_windows:
+    icon = icon_init()
+else:
+    display = display_init()
 
 # Load pre-trained object detection model (https://github.com/chuanqi305/MobileNet-SSD)
 net = cv2.dnn.readNetFromCaffe('assets/deploy.prototxt', 'assets/mobilenet_iter_73000.caffemodel')
@@ -138,12 +342,8 @@ rtsp_url = f"rtsp://{rtsp_username}:{rtsp_password}@{rtsp_address}"
 # Initial connection to the RTSP stream
 cap = connect_to_rtsp_stream(rtsp_url)
 
-font_path = "assets/RobotoMonoMedium.ttf"
-font_size = 24
-font = ImageFont.truetype(font_path, font_size)
-
 # Interval to run the recognition (in seconds)
-recognition_interval = 30
+recognition_interval = 1
 
 # Parking spot status: False means no car, True means car present
 car_present = False
@@ -164,7 +364,7 @@ while True:
     
     # If frame is not grabbed, reconnect to the stream
     if not ret:
-        debug_log("Failed to grab frame. Reconnecting to the stream...")
+        log.warning("Failed to grab frame. Reconnecting to the stream...")
         cap.release()  # Release the previous connection
         cap = connect_to_rtsp_stream(rtsp_url)  # Reconnect to the stream
         time.sleep(5)  # Add a small delay to avoid tight looping
@@ -187,6 +387,8 @@ while True:
         net.setInput(blob)
         detections = net.forward()
 
+        debug_image = draw_debug_image(roi, detections)
+
         car_detected = False
 
         # Process detections
@@ -206,9 +408,9 @@ while True:
             car_history.pop(0)
 
         # Decide if the car is present based on the majority of recent detections
-        if sum(car_history) > 5:  # More than 5 out of the last 10 frames detect a car
+        if sum(car_history) >= 7:  # More than 7 out of the last 10 frames detect a car
             car_present = True
-        else:
+        elif sum(car_history) <= 3: # Less than 3 out of the last 10 frames detect no car
             car_present = False
 
         timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -227,18 +429,19 @@ while True:
             car_left_time = None
             update_icon_state(icon, "taken") # Update taskbar icon to red (taken)
 
-        history=''
-        for i, car in enumerate(car_history):
-            record = '✔️' if car else '❌'
-            history = f'{history}{record} '
+        log.debug(f"Current status: car_present = {car_present}, car_detected = {car_detected}")
+        
+        draw_statusbar(car_history, debug_image) 
 
-        # If in debug mode, log information and save the image with visual output
-        if args.debug:
-            debug_log(history)
-            debug_log(f"Current status: car_present = {car_present}, car_detected = {car_detected}")
-
+        # Save the debug image
         if args.image:
-            save_debug_image(roi, detections)
+            debug_image_path = f"debug/debug_output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
+            # if cv2.imwrite(debug_image_path, roi):
+            if debug_image.save(debug_image_path):
+                log.debug(f"Debug image saved: {debug_image_path}")
+            else:
+                log.warning(f"Error saving debug image: {debug_image_path}")   
+
 
     # Sleep for a short time (optional) to reduce CPU load
     time.sleep(1)
