@@ -2,7 +2,10 @@ import os
 import sys
 import cv2
 import time
+import board
+import random
 import logging
+import adafruit_dht
 import platform
 import argparse
 import subprocess
@@ -87,7 +90,7 @@ def display_init():
         # Clear display
         disp.clear()
         # Set the backlight
-        disp.bl_DutyCycle(10)
+        disp.bl_DutyCycle(100)
         log.debug('Finish display initialization')
 
     except IOError as e:
@@ -97,6 +100,7 @@ def display_init():
 
 def display_draw_status(disp, car_history, car_image):
     font = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 64)
+    font_sm = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 32)
     canvas = Image.new("RGB", (disp.width,disp.height), (255, 0, 255))
     width, height = car_image.size
     size=(240, 240)
@@ -129,12 +133,15 @@ def display_draw_status(disp, car_history, car_image):
     draw = ImageDraw.Draw(canvas)
     for i, car_present in enumerate(car_history):
         if car_present:
-            draw.rectangle([(i*24, 0), ((i+1)*24, 40)], fill = "GREEN", outline="BLACK")
+            draw.rectangle([(i*2, 0), ((i+1)*2, 40)], fill = "GREEN")
         else:
-            draw.rectangle([(i*24, 0), ((i+1)*24, 40)], fill = "RED", outline="BLACK")
+            draw.rectangle([(i*2, 0), ((i+1)*2, 40)], fill = "RED")
 
     if args.clock:
-        statustext_time = datetime.now().strftime('%H:%M')
+        if int(time.time()) % 2:
+            statustext_time = datetime.now().strftime('%H:%M')
+        else:
+            statustext_time = datetime.now().strftime('%H %M')
         draw_text_with_background(
             img=canvas,
             text=statustext_time,
@@ -145,7 +152,33 @@ def display_draw_status(disp, car_history, car_image):
             bg_color=(127, 0, 127)  # Background color 
         )
 
-    disp.ShowImage(canvas.rotate(180))
+    if args.sensor:
+        temp = sensor.temperature
+        temp_color = interpolate_color(temp)
+        humi = sensor.humidity
+        humi_color = interpolate_humidity_color(humi)
+
+        draw_text_with_background(
+            img=canvas,
+            text=f"{temp:0.1f}ºC",
+            font=font_sm,
+            position=(5, 120),
+            alignment='left',
+            text_color='black',
+            bg_color=temp_color
+        )
+
+        draw_text_with_background(
+            img=canvas,
+            text=f"{humi:0.1f}%",
+            font=font_sm,
+            position=(240, 120),
+            alignment='right',
+            text_color='black',
+            bg_color=temp_color
+        )
+
+    disp.ShowImage(canvas)
 
 def draw_text_with_background(img, text, font, position, alignment='center', text_color='black', bg_color='yellow'):
     draw = ImageDraw.Draw(img)
@@ -176,42 +209,64 @@ def draw_text_with_background(img, text, font, position, alignment='center', tex
 
     return img
 
+def interpolate_color(temp, min_temp=16, max_temp=28, room_temp=22):
+    # Define RGB values for red, yellow, and green
+    red = (255, 0, 0)
+    yellow = (255, 255, 0)
+    green = (0, 255, 0)
+
+    # Normalize temperature to a range between -1 and 1, where 0 is room temperature
+    if temp < room_temp:
+        # Cold side: from red (min_temp) to green (room_temp)
+        if temp <= min_temp:
+            return red
+        ratio = (temp - min_temp) / (room_temp - min_temp)
+        return (
+            int(red[0] + ratio * (green[0] - red[0])),  # Interpolate R
+            int(red[1] + ratio * (green[1] - red[1])),  # Interpolate G
+            int(red[2] + ratio * (green[2] - red[2]))   # Interpolate B
+        )
+    else:
+        # Warm side: from green (room_temp) to red (max_temp)
+        if temp >= max_temp:
+            return red
+        ratio = (temp - room_temp) / (max_temp - room_temp)
+        return (
+            int(green[0] + ratio * (red[0] - green[0])),  # Interpolate R
+            int(green[1] + ratio * (red[1] - green[1])),  # Interpolate G
+            int(green[2] + ratio * (red[2] - green[2]))   # Interpolate B
+        )
+
+def interpolate_humidity_color(humidity, min_humidity=25, max_humidity=75, optimal_humidity=50):
+    # Define RGB values for red, yellow, and green
+    red = (255, 0, 0)
+    yellow = (255, 255, 0)
+    green = (0, 255, 0)
+
+    # Normalize humidity to a range between -1 and 1, where 0 is optimal humidity
+    if humidity < optimal_humidity:
+        # Dry side: from red (min_humidity) to green (optimal_humidity)
+        if humidity <= min_humidity:
+            return red
+        ratio = (humidity - min_humidity) / (optimal_humidity - min_humidity)
+        return (
+            int(red[0] + ratio * (green[0] - red[0])),  # Interpolate R
+            int(red[1] + ratio * (green[1] - red[1])),  # Interpolate G
+            int(red[2] + ratio * (green[2] - red[2]))   # Interpolate B
+        )
+    else:
+        # Humid side: from green (optimal_humidity) to red (max_humidity)
+        if humidity >= max_humidity:
+            return red
+        ratio = (humidity - optimal_humidity) / (max_humidity - optimal_humidity)
+        return (
+            int(green[0] + ratio * (red[0] - green[0])),  # Interpolate R
+            int(green[1] + ratio * (red[1] - green[1])),  # Interpolate G
+            int(green[2] + ratio * (red[2] - green[2]))   # Interpolate B
+        )
+
 def display_exit(disp):
     disp.module_exit()
-
-def display_test(disp):
-    Font1 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 25)
-    Font2 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 35)
-    Font3 = ImageFont.truetype("assets/RobotoMonoMedium.ttf", 32)
-
-    log.debug('Create blank image for drawing.')
-    image1 = Image.new("RGB", (disp.width,disp.height ), (127, 127, 127))
-    draw = ImageDraw.Draw(image1)
-
-    draw.rectangle((25, 10, 26, 11), fill = "BLACK")
-    draw.rectangle((25, 25, 27, 27), fill = "BLACK")
-    draw.rectangle((25, 40, 28, 43), fill = "BLACK")
-    draw.rectangle((25, 55, 29, 59), fill = "BLACK")
-    
-    draw.rectangle([(40, 10), (90, 60)], fill = "WHITE", outline="BLUE")
-    draw.rectangle([(105, 10), (150, 60)], fill = "BLUE")
-    
-    draw.line([(40, 10), (90, 60)], fill = "RED", width = 1)
-    draw.line([(90, 10), (40, 60)], fill = "RED", width = 1)
-    draw.line([(130, 65), (130, 115)], fill = "RED", width = 1)
-    draw.line([(105, 90), (155, 90)], fill = "RED", width = 1)
-    
-    draw.arc((105, 65, 155, 115), 0, 360, fill =(0, 255, 0))
-    draw.ellipse((40, 65, 90, 115), fill = (0, 255, 0))
-    
-    draw.rectangle([(20, 120), (160, 153)], fill = "BLUE")
-    draw.text((25, 120), 'Hello world', fill = "RED", font=Font1)
-    draw.rectangle([(20,155), (192, 195)], fill = "RED")
-    draw.text((21, 155), 'WaveShare', fill = "WHITE", font=Font2)
-    draw.text((25, 190), '1234567890', fill = "GREEN", font=Font3)
-    
-    image1 = image1.rotate(180)
-    disp.ShowImage(image1)
 
 ####################################################################################################
 # Misc logging functionality
@@ -305,6 +360,8 @@ parser.add_argument("--debug", action="store_true", help="Enable debug logging."
 parser.add_argument("--image", action="store_true", help="Enable debug image output.")
 parser.add_argument("--notray", action="store_true", help="Disable Windows tray icon.")
 parser.add_argument("--clock",action="store_true", help="Display clock on the SPI Display")
+parser.add_argument("--sensor",action="store_true", help="Display DHT22 readings on the SPI Display")
+
 args = parser.parse_args()
 
 if args.debug:
@@ -324,6 +381,7 @@ if is_windows:
     icon = icon_init()
 else:
     display = display_init()
+    sensor = adafruit_dht.DHT22(board.D4)
 
 # Load pre-trained object detection model (https://github.com/chuanqi305/MobileNet-SSD)
 net = cv2.dnn.readNetFromCaffe('assets/deploy.prototxt', 'assets/mobilenet_iter_73000.caffemodel')
@@ -404,13 +462,13 @@ while True:
         car_history.append(car_detected)
 
         # Keep only the last 10 frames in history
-        if len(car_history) > 10:
+        if len(car_history) > 120:
             car_history.pop(0)
 
         # Decide if the car is present based on the majority of recent detections
-        if sum(car_history) >= 7:  # More than 7 out of the last 10 frames detect a car
+        if sum(car_history) >= 80:  # More than 80 out of the last 120 frames detect a car
             car_present = True
-        elif sum(car_history) <= 3: # Less than 3 out of the last 10 frames detect no car
+        elif sum(car_history) <= 40: # Less than 40 out of the last 120 frames detect no car
             car_present = False
 
         timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -444,6 +502,6 @@ while True:
 
 
     # Sleep for a short time (optional) to reduce CPU load
-    time.sleep(1)
+    time.sleep(0.1)
 
 cap.release()
