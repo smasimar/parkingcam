@@ -154,9 +154,9 @@ def display_draw_status(disp, car_history, car_image):
 
     if args.sensor:
         temp = sensor.temperature
-        temp_color = interpolate_color(temp)
+        temp_color = interpolate_color(temp,16,22,28)
         humi = sensor.humidity
-        humi_color = interpolate_humidity_color(humi)
+        humi_color = interpolate_color(humi,25,50,75)
 
         draw_text_with_background(
             img=canvas,
@@ -209,56 +209,28 @@ def draw_text_with_background(img, text, font, position, alignment='center', tex
 
     return img
 
-def interpolate_color(temp, min_temp=16, max_temp=28, room_temp=22):
+def interpolate_color(curr_value, min_value, ideal_value, max_value):
     # Define RGB values for red, yellow, and green
     red = (255, 0, 0)
     yellow = (255, 255, 0)
     green = (0, 255, 0)
 
-    # Normalize temperature to a range between -1 and 1, where 0 is room temperature
-    if temp < room_temp:
-        # Cold side: from red (min_temp) to green (room_temp)
-        if temp <= min_temp:
+    # Normalize value to a range between -1 and 1, where 0 is ideal value
+    if curr_value < ideal_value:
+        # Min side: from red (min_value) to green (ideal_value)
+        if curr_value <= min_value:
             return red
-        ratio = (temp - min_temp) / (room_temp - min_temp)
+        ratio = (curr_value - min_value) / (ideal_value - min_value)
         return (
             int(red[0] + ratio * (green[0] - red[0])),  # Interpolate R
             int(red[1] + ratio * (green[1] - red[1])),  # Interpolate G
             int(red[2] + ratio * (green[2] - red[2]))   # Interpolate B
         )
     else:
-        # Warm side: from green (room_temp) to red (max_temp)
-        if temp >= max_temp:
+        # Max side: from green (ideal_value) to red (max_value)
+        if curr_value >= max_value:
             return red
-        ratio = (temp - room_temp) / (max_temp - room_temp)
-        return (
-            int(green[0] + ratio * (red[0] - green[0])),  # Interpolate R
-            int(green[1] + ratio * (red[1] - green[1])),  # Interpolate G
-            int(green[2] + ratio * (red[2] - green[2]))   # Interpolate B
-        )
-
-def interpolate_humidity_color(humidity, min_humidity=25, max_humidity=75, optimal_humidity=50):
-    # Define RGB values for red, yellow, and green
-    red = (255, 0, 0)
-    yellow = (255, 255, 0)
-    green = (0, 255, 0)
-
-    # Normalize humidity to a range between -1 and 1, where 0 is optimal humidity
-    if humidity < optimal_humidity:
-        # Dry side: from red (min_humidity) to green (optimal_humidity)
-        if humidity <= min_humidity:
-            return red
-        ratio = (humidity - min_humidity) / (optimal_humidity - min_humidity)
-        return (
-            int(red[0] + ratio * (green[0] - red[0])),  # Interpolate R
-            int(red[1] + ratio * (green[1] - red[1])),  # Interpolate G
-            int(red[2] + ratio * (green[2] - red[2]))   # Interpolate B
-        )
-    else:
-        # Humid side: from green (optimal_humidity) to red (max_humidity)
-        if humidity >= max_humidity:
-            return red
-        ratio = (humidity - optimal_humidity) / (max_humidity - optimal_humidity)
+        ratio = (curr_value - ideal_value) / (max_value - ideal_value)
         return (
             int(green[0] + ratio * (red[0] - green[0])),  # Interpolate R
             int(green[1] + ratio * (red[1] - green[1])),  # Interpolate G
