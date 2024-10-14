@@ -2,10 +2,8 @@ import os
 import sys
 import cv2
 import time
-import board
 import random
 import logging
-import adafruit_dht
 import platform
 import argparse
 import subprocess
@@ -65,10 +63,12 @@ def update_icon_state(icon, state):
         icon.icon = Image.open("assets/car_green.ico")
 
 ####################################################################################################
-# RPi SPI display-related function definitions
+# RPi DHT sensor and SPI display related function definitions
 ####################################################################################################
 
 if not is_windows:
+    import board
+    import adafruit_dht
     import spidev as SPI
     sys.path.append("..")
     from lib import LCD_1inch69
@@ -153,30 +153,33 @@ def display_draw_status(disp, car_history, car_image):
         )
 
     if args.sensor:
-        temp = sensor.temperature
-        temp_color = interpolate_color(temp,16,22,28)
-        humi = sensor.humidity
-        humi_color = interpolate_color(humi,25,50,75)
+        try:
+            temp = sensor.temperature
+            humi = sensor.humidity
+        except RuntimeError:
+            log.warning('DHT reading failed')
+        else: 
+            temp_color = interpolate_color(temp,16,22,28)
+            draw_text_with_background(
+                img=canvas,
+                text=f"{temp:0.1f}ºC",
+                font=font_sm,
+                position=(5, 120),
+                alignment='left',
+                text_color='black',
+                bg_color=temp_color
+            )
 
-        draw_text_with_background(
-            img=canvas,
-            text=f"{temp:0.1f}ºC",
-            font=font_sm,
-            position=(5, 120),
-            alignment='left',
-            text_color='black',
-            bg_color=temp_color
-        )
-
-        draw_text_with_background(
-            img=canvas,
-            text=f"{humi:0.1f}%",
-            font=font_sm,
-            position=(240, 120),
-            alignment='right',
-            text_color='black',
-            bg_color=temp_color
-        )
+            humi_color = interpolate_color(humi,25,50,75)
+            draw_text_with_background(
+                img=canvas,
+                text=f"{humi:0.1f}%",
+                font=font_sm,
+                position=(240, 120),
+                alignment='right',
+                text_color='black',
+                bg_color=temp_color
+            )
 
     disp.ShowImage(canvas)
 
@@ -241,13 +244,13 @@ def display_exit(disp):
     disp.module_exit()
 
 ####################################################################################################
-# Misc logging functionality
+# Common functionality
 ####################################################################################################
 
 # Function to log car activity (arrival and departure)
-def log_car_activity(action, timestamp):
+def log_car_activity(timestamp, action):
     log_entry=f'{timestamp} :: {action}'
-    log.debug(log_entry)
+    log.info(log_entry)
     with open('car.log', 'a') as log_file:
         log_file.write(f'{log_entry}\n')
 
@@ -276,6 +279,7 @@ def draw_debug_image(roi, detections):
                     16: 'pottedplant', 17: 'sheep', 18: 'sofa', 19: 'train', 20: 'tvmonitor'}
     class_colors = {7: (255, 0, 255), 4: (255, 0, 255), 9: (255, 0, 255), 20: (255, 0, 255)}
     outlinecolor = (0, 0, 0) # Black outline
+    image_pil = Image.fromarray(roi)
 
     # Loop over all detections and draw the bounding boxes
     for i in range(detections.shape[2]):
@@ -430,6 +434,8 @@ while True:
                     car_detected = True
                     break
 
+        timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
         # Append result to detection history for averaging
         car_history.append(car_detected)
 
@@ -439,27 +445,17 @@ while True:
 
         # Decide if the car is present based on the majority of recent detections
         if sum(car_history) >= 80:  # More than 80 out of the last 120 frames detect a car
+            if not car_present:
+                log_car_activity(timestamp_str, "Car arrived back")
+                if is_windows:
+                    update_icon_state(icon, "taken") # Update taskbar icon to red (taken)
             car_present = True
         elif sum(car_history) <= 40: # Less than 40 out of the last 120 frames detect no car
+            if car_present:
+                log_car_activity(timestamp_str, "Car left the parking spot")
+                if is_windows:
+                    update_icon_state(icon, "free") # Update taskbar icon to green (free)
             car_present = False
-
-        timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # Check if the car was present and is now gone (car just left)
-        if car_present and not car_detected and not car_left_time:
-            log_car_activity("Car left the parking spot", timestamp_str)
-            car_present = False
-            car_left_time = timestamp_str
-            update_icon_state(icon, "free") # Update taskbar icon to green (free)
-
-        # Check if the car just arrived back in the spot
-        if not car_present and car_detected and car_left_time:
-            log_car_activity("Car arrived back", timestamp_str)
-            car_present = True
-            car_left_time = None
-            update_icon_state(icon, "taken") # Update taskbar icon to red (taken)
-
-        log.debug(f"Current status: car_present = {car_present}, car_detected = {car_detected}")
         
         draw_statusbar(car_history, debug_image) 
 
@@ -467,10 +463,12 @@ while True:
         if args.image:
             debug_image_path = f"debug/debug_output_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
             # if cv2.imwrite(debug_image_path, roi):
-            if debug_image.save(debug_image_path):
-                log.debug(f"Debug image saved: {debug_image_path}")
+            try:
+                debug_image.save(debug_image_path)
+            except IOError:
+                log.warning(f"Couldn't save debug image: {debug_image_path}")   
             else:
-                log.warning(f"Error saving debug image: {debug_image_path}")   
+                log.debug(f"Debug image saved: {debug_image_path}")
 
 
     # Sleep for a short time (optional) to reduce CPU load
