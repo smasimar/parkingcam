@@ -8,7 +8,7 @@ import platform
 import argparse
 import subprocess
 import numpy as np
-from datetime import datetime
+from datetime import datetime, time as dtime
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -443,21 +443,28 @@ while True:
         if len(car_history) > 120:
             car_history.pop(0)
 
-        # Decide if the car is present based on the majority of recent detections
-        if sum(car_history) >= 80:  # More than 80 out of the last 120 frames detect a car
-            if not car_present:
-                log_car_activity(timestamp_str, "Car arrived back")
-                if is_windows:
-                    update_icon_state(icon, "taken") # Update taskbar icon to red (taken)
-            car_present = True
-        elif sum(car_history) <= 40: # Less than 40 out of the last 120 frames detect no car
-            if car_present:
-                log_car_activity(timestamp_str, "Car left the parking spot")
-                if is_windows:
-                    update_icon_state(icon, "free") # Update taskbar icon to green (free)
-            car_present = False
+        # Get the current time
+        current_time = datetime.now().time()
+        # Define the start and end times
+        start_time = dtime(8, 0)  # 08:00
+        end_time = dtime(20, 0)   # 20:00
+
+        if start_time <= current_time <= end_time:
+            # Decide if the car is present based on the majority of recent detections
+            if sum(car_history) >= 80:  # More than 80 out of the last 120 frames detect a car
+                if not car_present:
+                    log_car_activity(timestamp_str, "Car arrived back")
+                    if is_windows:
+                        update_icon_state(icon, "taken") # Update taskbar icon to red (taken)
+                car_present = True
+            elif sum(car_history) <= 40: # Less than 40 out of the last 120 frames detect no car
+                if car_present:
+                    log_car_activity(timestamp_str, "Car left the parking spot")
+                    if is_windows:
+                        update_icon_state(icon, "free") # Update taskbar icon to green (free)
+                car_present = False
         
-        draw_statusbar(car_history, debug_image) 
+        draw_statusbar(car_history, debug_image)
 
         # Save the debug image
         if args.image:
