@@ -178,7 +178,7 @@ def display_draw_status(disp, car_history, car_image):
                 position=(240, 120),
                 alignment='right',
                 text_color='black',
-                bg_color=temp_color
+                bg_color=humi_color
             )
 
     disp.ShowImage(canvas)
