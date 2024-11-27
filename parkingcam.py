@@ -277,7 +277,7 @@ def draw_debug_image(roi, detections):
                     5: 'bottle', 6: 'bus', 7: 'car', 8: 'cat', 9: 'chair', 10: 'cow', 
                     11: 'diningtable', 12: 'dog', 13: 'horse', 14: 'motorbike', 15: 'person', 
                     16: 'pottedplant', 17: 'sheep', 18: 'sofa', 19: 'train', 20: 'tvmonitor'}
-    class_colors = {7: (255, 0, 255), 4: (255, 0, 255), 9: (255, 0, 255), 20: (255, 0, 255)}
+    class_colors = {4: (0, 255, 0), 7: (255, 0, 0), 9: (255, 0, 255), 15: (255, 255, 0), 20: (0, 255, 255)}
     outlinecolor = (0, 0, 0) # Black outline
     image_pil = Image.fromarray(roi)
 
@@ -430,7 +430,7 @@ while True:
             confidence = detections[0, 0, i, 2]
             if confidence > 0.4:  # Confidence threshold for detection
                 class_id = int(detections[0, 0, i, 1])
-                if class_id in [4, 7, 9, 20]: # anything goes, depending on lighting and reflections
+                if class_id in [4, 7, 9, 15, 20]: # anything goes, depending on lighting and reflections
                     car_detected = True
                     break
 
