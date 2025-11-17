@@ -7,6 +7,7 @@ import logging
 import signal
 import configparser
 import argparse
+import hashlib
 from datetime import datetime
 from contextlib import contextmanager
 from PIL import Image, ImageDraw, ImageFont
@@ -110,48 +111,52 @@ def get_config_bool(config, section, option, fallback=False):
 def get_default_config():
     """Return default configuration"""
     config = configparser.ConfigParser()
-    config['RTSP'] = {'username': '', 'password': '', 'address': '', 'timeout': '10'}
+    config['RTSP'] = {'url': '', 'timeout': '10'}
     config['VIDEO'] = {'use_local_file': 'false', 'local_file_path': ''}
-    config['ROI'] = {'x': '800', 'y': '500', 'width': '550', 'height': '580', 'use_full_frame': 'false'}
+    config['ROI'] = {'point_x': '750', 'point_y': '400', 'quadrant': '4', 'use_full_frame': 'false'}
     config['TEMPERATURE'] = {'enabled': 'false', 'min_value': '16', 'ideal_value': '22', 'max_value': '28'}
     config['HUMIDITY'] = {'enabled': 'false', 'min_value': '25', 'ideal_value': '50', 'max_value': '75'}
     config['DETECTION'] = {'confidence_threshold': '0.4', 'history_size': '120', 
                            'car_present_threshold': '80', 'car_absent_threshold': '40', 
-                           'show_statusbar': 'true', 'cv_interval': '1.0'}
+                           'show_statusbar': 'true', 'cv_interval': '1.0',
+                           'temporal_smoothing_cycles': '1'}
     config['CLOCK'] = {'enabled': 'false'}
     config['DISPLAY'] = {'font_path': 'assets/RobotoMonoMedium.ttf'}
     return config
 
 def get_rtsp_url(config):
-    """Construct RTSP URL from config, return None if not configured
-    Supports both authenticated (username:password@address) and anonymous (address) streams
-    Adds TCP transport parameter for better reliability (reduces decoding errors)
+    """Get RTSP URL from config, return None if not configured
+    
+    Reads the full RTSP URL from config (format: rtsp://username:password@address:port/path)
+    Adds TCP transport parameter for better reliability (reduces decoding errors) if not present.
+    
+    Args:
+        config: Configuration object
+    
+    Returns:
+        Complete RTSP URL with TCP transport parameter, or None if not configured
     """
-    username = config.get('RTSP', 'username', fallback='').strip()
-    password = config.get('RTSP', 'password', fallback='').strip()
-    address = config.get('RTSP', 'address', fallback='').strip()
+    rtsp_url = config.get('RTSP', 'url', fallback='').strip()
     
-    # Address is required
-    if not address:
+    # URL is required
+    if not rtsp_url:
         return None
     
-    # Build base URL
-    if username and password:
-        base_url = f"rtsp://{username}:{password}@{address}"
-    elif not username and not password:
-        base_url = f"rtsp://{address}"
-    else:
-        # Invalid: only one credential provided
-        return None
+    # Add rtsp:// prefix if not present (allows config to omit prefix)
+    if not rtsp_url.startswith('rtsp://'):
+        rtsp_url = f"rtsp://{rtsp_url}"
     
-    # Add TCP transport parameter for better reliability (reduces decoding errors)
+    # Add TCP transport parameter for better reliability (reduces packet loss)
     # Use ?transport=tcp to force TCP instead of UDP
-    if '?' in base_url:
-        url = f"{base_url}&transport=tcp"
+    if 'transport=' in rtsp_url:
+        # Transport parameter already present, return as-is
+        return rtsp_url
+    elif '?' in rtsp_url:
+        # URL already has query parameters, append with &
+        return f"{rtsp_url}&transport=tcp"
     else:
-        url = f"{base_url}?transport=tcp"
-    
-    return url
+        # No query parameters, add with ?
+        return f"{rtsp_url}?transport=tcp"
 
 ####################################################################################################
 # Detection configuration
@@ -563,10 +568,33 @@ def interpolate_color(curr_value, min_value, ideal_value, max_value):
         )
 
 def display_exit(disp):
-    """Clean up display resources"""
+    """Clean up display resources and properly shut down LCD screen
+    
+    Turns off backlight, clears screen, and releases hardware resources.
+    Important for systemd services to ensure display is off on shutdown.
+    """
     if disp is not None:
         try:
+            log.info("Shutting down LCD display...")
+            # Turn off backlight
+            try:
+                disp.bl_DutyCycle(0)
+                time.sleep(0.05)  # Brief delay to ensure backlight turns off
+            except Exception as e:
+                log.debug(f"Error turning off backlight: {e}")
+            
+            # Clear screen to black (optional, but clean)
+            try:
+                # Create a black image to clear the display
+                black_image = Image.new('RGB', (disp.width, disp.height), (0, 0, 0))
+                disp.ShowImage(black_image)
+                time.sleep(0.01)  # Brief delay to ensure image is displayed
+            except Exception as e:
+                log.debug(f"Error clearing screen: {e}")
+            
+            # Release hardware resources (GPIO, SPI)
             disp.module_exit()
+            log.info("LCD display shut down successfully")
         except Exception as e:
             log.error(f"Error during display exit: {e}")
 
@@ -936,18 +964,84 @@ else:
         rtsp_timeout = config.getint('RTSP', 'timeout', fallback=10)
         cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
 
-# Get configuration values
-roi_x = config.getint('ROI', 'x', fallback=800)
-roi_y = config.getint('ROI', 'y', fallback=500)
-roi_w = config.getint('ROI', 'width', fallback=550)
-roi_h = config.getint('ROI', 'height', fallback=580)
+# Get ROI configuration (point + quadrant)
+roi_point_x = config.getint('ROI', 'point_x', fallback=750)
+roi_point_y = config.getint('ROI', 'point_y', fallback=400)
+roi_quadrant = config.getint('ROI', 'quadrant', fallback=4)
 use_full_frame = get_config_bool(config, 'ROI', 'use_full_frame', fallback=False)
+
+# ROI will be calculated from point + quadrant when we have frame dimensions
+# Function to calculate ROI coordinates from point + quadrant
+def calculate_roi_from_point_quadrant(point_x, point_y, quadrant, frame_width, frame_height):
+    """Calculate ROI (x, y, width, height) from point and quadrant
+    
+    Quadrants:
+    1 = Top right: from point to top-right corner (point is bottom-left of ROI)
+    2 = Top left: from point to top-left corner (point is bottom-right of ROI)
+    3 = Bottom left: from point to bottom-left corner (point is top-right of ROI)
+    4 = Bottom right: from point to bottom-right corner (point is top-left of ROI)
+    
+    Args:
+        point_x, point_y: Point coordinates
+        quadrant: Quadrant number (1-4)
+        frame_width, frame_height: Frame dimensions
+    
+    Returns:
+        Tuple of (x, y, width, height) for ROI
+    """
+    if quadrant == 1:  # Top right
+        x = point_x
+        y = 0
+        width = frame_width - point_x
+        height = point_y
+    elif quadrant == 2:  # Top left
+        x = 0
+        y = 0
+        width = point_x
+        height = point_y
+    elif quadrant == 3:  # Bottom left
+        x = 0
+        y = point_y
+        width = point_x
+        height = frame_height - point_y
+    elif quadrant == 4:  # Bottom right
+        x = point_x
+        y = point_y
+        width = frame_width - point_x
+        height = frame_height - point_y
+    else:
+        log.warning(f"Invalid quadrant {quadrant}, defaulting to quadrant 4 (bottom right)")
+        x = point_x
+        y = point_y
+        width = frame_width - point_x
+        height = frame_height - point_y
+    
+    # Ensure valid dimensions
+    x = max(0, min(x, frame_width - 1))
+    y = max(0, min(y, frame_height - 1))
+    width = max(1, min(width, frame_width - x))
+    height = max(1, min(height, frame_height - y))
+    
+    return x, y, width, height
+
+# ROI coordinates will be calculated dynamically based on frame dimensions
+roi_x = None
+roi_y = None
+roi_w = None
+roi_h = None
 
 cv_interval = config.getfloat('DETECTION', 'cv_interval', fallback=1.0)
 confidence_threshold = config.getfloat('DETECTION', 'confidence_threshold', fallback=0.4)
 history_size = config.getint('DETECTION', 'history_size', fallback=120)
 car_present_threshold = config.getint('DETECTION', 'car_present_threshold', fallback=80)
 car_absent_threshold = config.getint('DETECTION', 'car_absent_threshold', fallback=40)
+
+# Temporal smoothing window: keep car detected for N detection cycles after last successful detection
+# Number of whole detection cycles to persist detection after last success
+# Example: 1 = keep detected for 1 cycle after last success (covers 1 missed detection)
+temporal_smoothing_cycles = config.getint('DETECTION', 'temporal_smoothing_cycles', fallback=1)
+temporal_smoothing_window = cv_interval * temporal_smoothing_cycles
+log.info(f"Temporal smoothing: {temporal_smoothing_window:.1f}s window ({temporal_smoothing_cycles} cycle(s) x cv_interval={cv_interval:.1f}s)")
 
 # Parking spot detection state
 last_cv_time = time.time()  # Timestamp of last CV processing run
@@ -958,6 +1052,14 @@ latest_detections = None  # YOLO detection results for bounding box overlay
 latest_detection_frame_size = None  # (width, height) tuple for coordinate scaling
 cv_processing = False  # Flag to prevent multiple concurrent CV processing threads
 display_lock = None
+
+# Frame caching for static scenes (detect identical frames)
+last_frame_hash = None
+last_frame_detection_result = None  # (car_detected, detections, frame_size)
+last_frame_hash_time = None
+
+# Temporal smoothing for missed detections
+last_car_detection_time = None  # Timestamp of last successful car detection (initialized above)
 try:
     import threading
     display_lock = threading.Lock()
@@ -979,12 +1081,45 @@ def get_cached_font(font_path, size, logger=None):
 _cached_font_metrics = {}
 
 
-def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, 
-                         yolo_model, confidence_threshold):
+def compute_frame_hash(frame):
+    """Compute a fast hash of frame for similarity detection
+    
+    Uses a downsampled grayscale version for speed.
+    Returns None if frame is None.
+    
+    Args:
+        frame: OpenCV frame (numpy array)
+    
+    Returns:
+        String hash of frame, or None if frame is None or error occurs
+    """
+    if frame is None:
+        return None
+    
+    try:
+        # Convert to grayscale and downsample for fast hashing
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+        # Use hash of flattened array
+        frame_bytes = small.tobytes()
+        return hashlib.md5(frame_bytes).hexdigest()
+    except Exception as e:
+        log.debug(f"Error computing frame hash: {e}")
+        return None
+
+def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
+                         yolo_model, confidence_threshold, 
+                         last_frame_hash=None, last_frame_detection_result=None,
+                         last_car_detection_time=None, temporal_smoothing_window=3.0,
+                         roi_point_x=None, roi_point_y=None, roi_quadrant=None):
     """Process a frame with YOLO detection (runs in separate thread or at intervals)
     
     Detects objects in CAR_STATUS_TRIGGER_CLASSES (currently car and suitcase) in the frame or ROI.
     Only these classes trigger the parking spot "occupied" status.
+    
+    Implements hybrid caching approach:
+    - Frame hash comparison: If frame is identical to last processed frame, reuse cached detection
+    - Temporal smoothing: If frame is different but car was detected recently, keep it detected
     
     Args:
         frame: OpenCV frame (numpy array)
@@ -992,17 +1127,19 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (only used if use_full_frame=False)
         yolo_model: YOLOv11 model instance
         confidence_threshold: Minimum confidence for detections (0.0-1.0)
+        last_frame_hash: Hash of last processed frame (for caching)
+        last_frame_detection_result: Cached (car_detected, detections, frame_size) tuple
+        last_car_detection_time: Timestamp of last successful car detection (for temporal smoothing)
+        temporal_smoothing_window: Time window in seconds for temporal smoothing (calculated as cv_interval * cycles)
     
     Returns:
-        Tuple of (car_detected, detections, frame_size):
+        Tuple of (car_detected, detections, frame_size, frame_hash):
         - car_detected: Boolean indicating if car/suitcase was detected
         - detections: YOLO detection results (for bounding box overlay)
         - frame_size: (width, height) tuple of the detection region
+        - frame_hash: Hash of processed frame for next comparison
     """
     try:
-        car_detected = False
-        detections = None
-        
         # Determine what region to use for detection
         if use_full_frame:
             # Use entire frame for detection
@@ -1012,6 +1149,14 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         else:
             # Extract ROI from frame (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
+            
+            # Calculate ROI from point + quadrant if not already calculated
+            if roi_x is None and roi_point_x is not None and roi_point_y is not None and roi_quadrant is not None:
+                roi_x, roi_y, roi_w, roi_h = calculate_roi_from_point_quadrant(
+                    roi_point_x, roi_point_y, roi_quadrant, frame_w, frame_h
+                )
+                log.debug(f"Calculated ROI from point ({roi_point_x},{roi_point_y}) + quadrant {roi_quadrant}: ({roi_x},{roi_y},{roi_w},{roi_h})")
+            
             # Store original ROI values for logging
             original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
             # Validate and clamp ROI bounds to ensure they fit within frame
@@ -1028,6 +1173,24 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
             detection_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
             frame_h, frame_w = roi_h, roi_w
             frame_size = (frame_w, frame_h)
+        
+        # Compute hash of current frame for caching
+        current_frame_hash = compute_frame_hash(detection_frame)
+        
+        # HYBRID APPROACH #1: Frame hash comparison - reuse cached result if frame is identical
+        if (current_frame_hash is not None and 
+            last_frame_hash is not None and 
+            current_frame_hash == last_frame_hash and
+            last_frame_detection_result is not None):
+            car_detected, detections, cached_frame_size = last_frame_detection_result
+            # Verify frame size still matches
+            if cached_frame_size == frame_size:
+                log.debug("Frame unchanged - reusing cached detection result")
+                return car_detected, detections, frame_size, current_frame_hash
+        
+        # Frame is different or no cache - run detection
+        car_detected = False
+        detections = None
         
         # YOLO detection (COCO classes)
         # Check for classes defined in CAR_STATUS_TRIGGER_CLASSES for parking spot occupancy
@@ -1051,26 +1214,39 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                         car_detected = True
                         break
         
-        return car_detected, detections, frame_size
+        # HYBRID APPROACH #2: Temporal smoothing - if detection failed but car was detected recently, keep it
+        if not car_detected and last_car_detection_time is not None:
+            current_time = time.time()
+            time_since_last_detection = current_time - last_car_detection_time
+            if time_since_last_detection < temporal_smoothing_window:
+                log.debug(f"Temporal smoothing: keeping car detected (last detection {time_since_last_detection:.1f}s ago)")
+                car_detected = True
+                # Note: We still return the current detections (might be None), not cached ones
+                # This keeps the bounding boxes from disappearing immediately
+        
+        return car_detected, detections, frame_size, current_frame_hash
     except Exception as e:
         log.error(f"Error processing frame with CV: {e}")
         if use_full_frame:
             frame_h, frame_w = frame.shape[:2] if frame is not None else (480, 640)
         else:
             frame_w, frame_h = roi_w, roi_h
-        return False, None, (frame_w, frame_h)
+        return False, None, (frame_w, frame_h), None
 
-def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=None):
+def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=None,
+                          roi_point_x=None, roi_point_y=None, roi_quadrant=None):
     """Prepare frame for display (without CV processing)
     
     Extracts ROI if needed and converts OpenCV BGR format to PIL RGB format.
     Performs bounds validation and clamping to ensure ROI fits within frame.
+    If roi_x is None, calculates ROI from point + quadrant based on frame dimensions.
     
     Args:
         frame: OpenCV frame (numpy array) or None
         use_full_frame: If True, use entire frame; if False, extract ROI
-        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates
+        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (None if not yet calculated)
         config: Configuration object (optional)
+        roi_point_x, roi_point_y, roi_quadrant: ROI point and quadrant (used if roi_x is None)
     
     Returns:
         PIL Image ready for display, or placeholder image if frame is None
@@ -1079,6 +1255,9 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
         if use_full_frame:
             return create_placeholder_image(640, 480, config)
         else:
+            # For placeholder, use default ROI size if not calculated yet
+            if roi_w is None or roi_h is None:
+                return create_placeholder_image(550, 580, config)
             return create_placeholder_image(roi_w, roi_h, config)
     
     try:
@@ -1089,6 +1268,14 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
         else:
             # Extract ROI and convert to PIL Image (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
+            
+            # Calculate ROI from point + quadrant if not already calculated
+            if roi_x is None and roi_point_x is not None and roi_point_y is not None and roi_quadrant is not None:
+                roi_x, roi_y, roi_w, roi_h = calculate_roi_from_point_quadrant(
+                    roi_point_x, roi_point_y, roi_quadrant, frame_w, frame_h
+                )
+                log.debug(f"Calculated ROI from point ({roi_point_x},{roi_point_y}) + quadrant {roi_quadrant}: ({roi_x},{roi_y},{roi_w},{roi_h})")
+            
             # Store original ROI values for logging
             original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
             # Validate and clamp ROI bounds to ensure they fit within frame
@@ -1114,24 +1301,61 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
 
 def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                         yolo_model, confidence_threshold,
-                        car_history, history_size, car_present_threshold, car_absent_threshold):
+                        car_history, history_size, car_present_threshold, car_absent_threshold,
+                        roi_point_x=None, roi_point_y=None, roi_quadrant=None):
     """Background thread function for CV processing
     
     Runs YOLO detection on a frame and updates shared state:
     - latest_detections: Detection results for bounding box overlay
     - latest_detection_frame_size: Size of the detection region
     - car_history: History buffer of car detection results (thread-safe)
+    - Frame caching and temporal smoothing state for hybrid approach
     
     Note: car_present_threshold and car_absent_threshold are not used here,
     they are applied later when evaluating the car_history buffer.
     """
     global latest_detections, latest_detection_frame_size, cv_processing
+    global last_frame_hash, last_frame_detection_result, last_frame_hash_time
+    global last_car_detection_time, temporal_smoothing_window
     
     try:
-        car_detected, detections, frame_size = process_cv_detection(
+        # Get current cache state (thread-safe read)
+        if display_lock:
+            with display_lock:
+                current_last_hash = last_frame_hash
+                current_last_result = last_frame_detection_result
+                current_last_detection_time = last_car_detection_time
+        else:
+            current_last_hash = last_frame_hash
+            current_last_result = last_frame_detection_result
+            current_last_detection_time = last_car_detection_time
+        
+        car_detected, detections, frame_size, frame_hash = process_cv_detection(
             frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-            yolo_model, confidence_threshold
+            yolo_model, confidence_threshold,
+            last_frame_hash=current_last_hash,
+            last_frame_detection_result=current_last_result,
+            last_car_detection_time=current_last_detection_time,
+            temporal_smoothing_window=temporal_smoothing_window,
+            roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
         )
+        
+        # Update frame cache and temporal smoothing state
+        if frame_hash is not None:
+            if display_lock:
+                with display_lock:
+                    last_frame_hash = frame_hash
+                    last_frame_detection_result = (car_detected, detections, frame_size)
+                    last_frame_hash_time = time.time()
+                    # Update temporal smoothing timestamp if car was detected
+                    if car_detected:
+                        last_car_detection_time = time.time()
+            else:
+                last_frame_hash = frame_hash
+                last_frame_detection_result = (car_detected, detections, frame_size)
+                last_frame_hash_time = time.time()
+                if car_detected:
+                    last_car_detection_time = time.time()
         
         # Update shared detection results
         if display_lock:
@@ -1208,14 +1432,21 @@ if args.save_frame:
             if ret and frame is not None:
                 log.info(f"Frame {frame_num} captured successfully ({frame.shape[1]}x{frame.shape[0]})")
                 # Prepare base image (ROI extraction if needed)
-                display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config)
+                display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config,
+                                                      roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant)
                 
                 # Run CV detection synchronously for bounding boxes
                 log.info("Running YOLO detection...")
                 try:
-                    car_detected, detections, frame_size = process_cv_detection(
+                    # In save-frame mode, we don't use caching (fresh detection every time)
+                    car_detected, detections, frame_size, _ = process_cv_detection(
                         frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                        yolo_model, confidence_threshold
+                        yolo_model, confidence_threshold,
+                        last_frame_hash=None,
+                        last_frame_detection_result=None,
+                        last_car_detection_time=None,
+                        temporal_smoothing_window=0.0,  # Disable temporal smoothing in save-frame mode
+                        roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
                     )
                     log.info(f"Detection complete: car_detected={car_detected}")
                 except KeyboardInterrupt:
@@ -1377,17 +1608,52 @@ try:
                 target=cv_processing_thread,
                 args=(frame.copy(), use_full_frame, roi_x, roi_y, roi_w, roi_h,
                       yolo_model, confidence_threshold,
-                      car_history, history_size, car_present_threshold, car_absent_threshold),
+                      car_history, history_size, car_present_threshold, car_absent_threshold,
+                      roi_point_x, roi_point_y, roi_quadrant),
                 daemon=True
             )
             thread.start()
         elif cv_should_run and frame is not None and ret and not HAS_THREADING:
             # Fallback: run CV synchronously if threading not available (not ideal)
             last_cv_time = current_time
-            car_detected, detections, frame_size = process_cv_detection(
+            
+            # Get current cache state (thread-safe read)
+            if display_lock:
+                with display_lock:
+                    current_last_hash = last_frame_hash
+                    current_last_result = last_frame_detection_result
+                    current_last_detection_time = last_car_detection_time
+            else:
+                current_last_hash = last_frame_hash
+                current_last_result = last_frame_detection_result
+                current_last_detection_time = last_car_detection_time
+            
+            car_detected, detections, frame_size, frame_hash = process_cv_detection(
                 frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                yolo_model, confidence_threshold
+                yolo_model, confidence_threshold,
+                last_frame_hash=current_last_hash,
+                last_frame_detection_result=current_last_result,
+                last_car_detection_time=current_last_detection_time,
+                temporal_smoothing_window=temporal_smoothing_window,
+                roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
             )
+            
+            # Update frame cache and temporal smoothing state
+            if frame_hash is not None:
+                if display_lock:
+                    with display_lock:
+                        last_frame_hash = frame_hash
+                        last_frame_detection_result = (car_detected, detections, frame_size)
+                        last_frame_hash_time = time.time()
+                        if car_detected:
+                            last_car_detection_time = time.time()
+                else:
+                    last_frame_hash = frame_hash
+                    last_frame_detection_result = (car_detected, detections, frame_size)
+                    last_frame_hash_time = time.time()
+                    if car_detected:
+                        last_car_detection_time = time.time()
+            
             latest_detections = detections
             latest_detection_frame_size = frame_size
             # Update car history (thread-safe)
@@ -1415,7 +1681,8 @@ try:
         
         # Always prepare and display the current frame (continuous video)
         if frame is not None and ret:
-            display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config)
+            display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config,
+                                                  roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant)
         else:
             # No frame available - use placeholder
             if use_full_frame:
