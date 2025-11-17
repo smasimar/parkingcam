@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import cv2
@@ -5,6 +6,7 @@ import time
 import logging
 import signal
 import configparser
+import argparse
 from datetime import datetime
 from contextlib import contextmanager
 from PIL import Image, ImageDraw, ImageFont
@@ -152,6 +154,14 @@ def get_rtsp_url(config):
     return url
 
 ####################################################################################################
+# Detection configuration
+####################################################################################################
+
+# COCO class IDs that trigger parking spot "occupied" status
+# These classes indicate a vehicle or large object is in the parking spot
+CAR_STATUS_TRIGGER_CLASSES = [2, 8, 28]  # 2=car, 8=boat, 28=suitcase
+
+####################################################################################################
 # RPi DHT sensor and SPI display related function definitions
 ####################################################################################################
 
@@ -175,112 +185,96 @@ def display_init():
         log.error(f"Unexpected error during display initialization: {e}")
         return None
 
-def display_draw_status(disp, car_history, car_image, config, sensor=None):
-    """Draw status on the display"""
-    if disp is None:
-        return
+def build_display_canvas(car_image, car_history, config, sensor=None, display_width=240, display_height=280):
+    """Build complete display canvas with all overlays
     
+    This function builds the complete image with statusbar, clock, temp/humidity, and video.
+    Can be used for both display output and saving to file.
+    
+    Args:
+        car_image: PIL Image (already processed with ROI if needed)
+        car_history: List of car detection history
+        config: Configuration object
+        sensor: DHT22 sensor object (optional)
+        display_width: Display width in pixels (default 240 for 1.69" LCD)
+        display_height: Display height in pixels (default 280 for 1.69" LCD)
+    
+    Returns:
+        PIL Image canvas with all overlays applied
+    """
     try:
         font_path = get_font_path(config)
-        font = load_font(font_path, 64, log)
-        font_sm = load_font(font_path, 32, log)
-        canvas = Image.new("RGB", (disp.width, disp.height), (0, 0, 0))
+        # Use cached fonts to avoid reloading every frame (optimization)
+        font = get_cached_font(font_path, 64, log)
+        font_sm = get_cached_font(font_path, 32, log)
+        canvas = Image.new("RGB", (display_width, display_height), (0, 0, 0))
         width, height = car_image.size
         
         # Check if we should fit full frame or use ROI
         use_full_frame = get_config_bool(config, 'ROI', 'use_full_frame', fallback=False)
         statusbar_height = 40 if get_config_bool(config, 'DETECTION', 'show_statusbar', fallback=True) else 0
         
-        # Clock, temp, and humidity are always enabled (if sensor available for temp/humidity)
+        # Temperature and humidity panels are enabled if DHT22 sensor is available
         temp_enabled = sensor is not None
         humi_enabled = sensor is not None
         
-        # Left panel for temp, humidity (stacked vertically, overlayed on video)
-        left_panel_width = disp.width // 2
+        # Temp and humidity panels (side by side in the same row, overlayed on video)
+        panel_width = display_width // 2  # Each panel takes half the screen width
         
-        # Calculate panel heights based on font size + margins
-        # Create a temporary draw object to measure font metrics
-        temp_draw = ImageDraw.Draw(canvas)
-        
-        # Clock panel: font size + margin top + margin bottom (always enabled)
-        # Note: margin value must match the margin used in draw_clock_panel()
-        clock_margin = 8
-        clock_bbox = temp_draw.textbbox((0, 0), "00:00", font=font)
-        clock_font_height = clock_bbox[3] - clock_bbox[1]
-        clock_panel_height = clock_font_height + (clock_margin * 2)
-        
-        # Temp/Humidity panels: font size + margin top + margin bottom
-        # Note: margin value must match the margin used in draw_temp_panel() and draw_humi_panel()
-        sensor_margin = 4
-        if temp_enabled or humi_enabled:
-            # Measure font height using sample text
+        # Calculate panel heights based on font size + margins (cached for performance)
+        # Cache key based on display dimensions and font sizes
+        metrics_key = (display_width, display_height, font_path)
+        if metrics_key not in _cached_font_metrics:
+            temp_draw = ImageDraw.Draw(canvas)
+            clock_margin = 8
+            clock_bbox = temp_draw.textbbox((0, 0), "00:00", font=font)
+            clock_font_height = clock_bbox[3] - clock_bbox[1]
+            sensor_margin = 8
             sensor_bbox = temp_draw.textbbox((0, 0), "00.0ºC", font=font_sm)
             sensor_font_height = sensor_bbox[3] - sensor_bbox[1]
-            sensor_panel_height = sensor_font_height + (sensor_margin * 2)
+            _cached_font_metrics[metrics_key] = {
+                'clock_font_height': clock_font_height,
+                'sensor_font_height': sensor_font_height
+            }
+        
+        metrics = _cached_font_metrics[metrics_key]
+        clock_margin = 8
+        clock_panel_height = metrics['clock_font_height'] + (clock_margin * 2)
+        
+        # Temp/Humidity panels: font size + margin top + margin bottom
+        sensor_margin = 8  # Use max margin for consistency (temp uses 4, humidity uses 8)
+        if temp_enabled or humi_enabled:
+            sensor_panel_height = metrics['sensor_font_height'] + (sensor_margin * 2)
         else:
             sensor_panel_height = 0
         
-        temp_panel_height = sensor_panel_height if temp_enabled else 0
-        humi_panel_height = sensor_panel_height if humi_enabled else 0
-        
         # Calculate video area: starts below clock, uses remaining space
         video_start_y = statusbar_height + clock_panel_height
-        available_height = disp.height - video_start_y  # Remaining height below clock
-        available_width = disp.width
+        available_height = display_height - video_start_y  # Remaining height below clock
+        available_width = display_width
         
-        if use_full_frame:
-            # Fit to height: scale video to match available height, crop sides if needed
-            scale = available_height / height
-            new_height = available_height
-            new_width = int(width * scale)
-            
-            # Resize maintaining aspect ratio
-            car_image = car_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # If scaled width is wider than screen, crop sides (center crop horizontally)
-            if new_width > available_width:
-                crop_left = (new_width - available_width) // 2
-                car_image = car_image.crop((crop_left, 0, crop_left + available_width, new_height))
-                x_offset = 0
-            else:
-                # If scaled width is narrower, center it (shouldn't happen often)
-                x_offset = (available_width - new_width) // 2
-            
-            # Position below clock
-            y_offset = video_start_y
+        # Note: car_image is already processed (ROI extracted if needed) by prepare_display_image()
+        # So we just need to scale and position it for display, regardless of use_full_frame setting
+        # Fit to height: scale video to match available height, crop sides if needed
+        scale = available_height / height
+        new_height = available_height
+        new_width = int(width * scale)
+        
+        # Resize maintaining aspect ratio
+        # Use BILINEAR instead of LANCZOS for better performance on RPi (quality still good)
+        car_image = car_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+        
+        # If scaled width is wider than screen, crop sides (center crop horizontally)
+        if new_width > available_width:
+            crop_left = (new_width - available_width) // 2
+            car_image = car_image.crop((crop_left, 0, crop_left + available_width, new_height))
+            x_offset = 0
         else:
-            # ROI mode: fit to height and crop sides
-            # Validate ROI bounds
-            roi_x_clamped = max(0, min(roi_x, width - 1))
-            roi_y_clamped = max(0, min(roi_y, height - 1))
-            roi_w_clamped = min(roi_w, width - roi_x_clamped)
-            roi_h_clamped = min(roi_h, height - roi_y_clamped)
-            
-            # Extract ROI
-            car_image = car_image.crop((roi_x_clamped, roi_y_clamped, 
-                                       roi_x_clamped + roi_w_clamped, 
-                                       roi_y_clamped + roi_h_clamped))
-            roi_width, roi_height = car_image.size
-            
-            # Fit to height: scale ROI to match available height, crop sides if needed
-            scale = available_height / roi_height
-            new_height = available_height
-            new_width = int(roi_width * scale)
-            
-            # Resize maintaining aspect ratio
-            car_image = car_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # If scaled width is wider than screen, crop sides (center crop horizontally)
-            if new_width > available_width:
-                crop_left = (new_width - available_width) // 2
-                car_image = car_image.crop((crop_left, 0, crop_left + available_width, new_height))
-                x_offset = 0
-            else:
-                # If scaled width is narrower, center it
-                x_offset = (available_width - new_width) // 2
-            
-            # Position below clock
-            y_offset = video_start_y
+            # If scaled width is narrower, center it
+            x_offset = (available_width - new_width) // 2
+        
+        # Position below clock
+        y_offset = video_start_y
 
         # Paste the processed image (full screen)
         canvas.paste(car_image, (x_offset, y_offset))
@@ -296,29 +290,44 @@ def display_draw_status(disp, car_history, car_image, config, sensor=None):
 
         # Draw clock row (always enabled, full width)
         clock_y = statusbar_height
-        draw_clock_panel(canvas, font, x=0, y=clock_y, width=disp.width, height=clock_panel_height, bg_color=(127, 0, 127))
+        draw_clock_panel(canvas, font, x=0, y=clock_y, width=display_width, height=clock_panel_height, bg_color=(127, 0, 127))
         
-        # Draw temperature and humidity panels (left half, stacked vertically, overlayed on video)
-        panel_x = 0
+        # Draw temperature and humidity panels (side by side in the same row, overlayed on video)
         panel_y = video_start_y  # Start at video area (below clock)
         
-        # Temperature panel
+        # Temperature panel (left half)
         if temp_enabled:
-            draw_temp_panel(canvas, font_sm, x=panel_x, y=panel_y, width=left_panel_width, height=temp_panel_height, 
+            draw_temp_panel(canvas, font_sm, x=0, y=panel_y, width=panel_width, height=sensor_panel_height, 
                           sensor=sensor, config=config)
-            panel_y += temp_panel_height
         
-        # Humidity panel
+        # Humidity panel (right half)
         if humi_enabled:
-            draw_humi_panel(canvas, font_sm, x=panel_x, y=panel_y, width=left_panel_width, height=humi_panel_height, 
+            draw_humi_panel(canvas, font_sm, x=panel_width, y=panel_y, width=panel_width, height=sensor_panel_height, 
                           sensor=sensor, config=config)
 
-        disp.ShowImage(canvas)
+        return canvas
+    except Exception as e:
+        log.error(f"Error building display canvas: {e}")
+        return None
+
+def display_draw_status(disp, car_history, car_image, config, sensor=None):
+    """Draw status on the display"""
+    if disp is None:
+        return
+    
+    try:
+        # Build canvas using extracted function
+        canvas = build_display_canvas(car_image, car_history, config, sensor, disp.width, disp.height)
+        if canvas is not None:
+            disp.ShowImage(canvas)
     except Exception as e:
         log.error(f"Error drawing display status: {e}")
 
 def draw_clock_panel(img, font, x, y, width, height, bg_color=(127, 0, 127), text_color='white'):
-    """Draw clock as a left-side panel with centered text"""
+    """Draw clock panel with centered text (full width across top of display)
+    
+    The colon blinks every second to indicate the clock is active.
+    """
     draw = ImageDraw.Draw(img)
     
     # Get current time
@@ -343,7 +352,7 @@ def draw_clock_panel(img, font, x, y, width, height, bg_color=(127, 0, 127), tex
     hours_top = hours_bbox[1]   # Offset from origin
     start_x = x + (width - total_width) // 2 - hours_left
     
-    # Center text vertically within panel with 5px margins top and bottom
+    # Center text vertically within panel with margins top and bottom
     margin = 8
     available_height = height - (margin * 2)  # Subtract top and bottom margins
     text_y = y + margin + (available_height - hours_height) // 2 - hours_top
@@ -372,13 +381,22 @@ def draw_clock_panel(img, font, x, y, width, height, bg_color=(127, 0, 127), tex
     return img
 
 def draw_temp_panel(img, font, x, y, width, height, sensor, config):
-    """Draw temperature as a left-side panel with centered text"""
+    """Draw temperature panel with centered text
+    
+    Background color interpolates from red (too cold) through green (ideal) to red (too hot)
+    based on configured temperature thresholds.
+    
+    If sensor reading times out, displays last known value with a red stale indicator line.
+    """
+    global last_temp_value, last_temp_text, last_temp_color, temp_is_stale
+    
     draw = ImageDraw.Draw(img)
     
     temp_text = None
     temp_color = None
+    is_stale = False
     
-    # Get temperature
+    # Get temperature - use cached value if sensor times out
     try:
         temp = sensor.temperature
         if temp is not None:
@@ -387,10 +405,29 @@ def draw_temp_panel(img, font, x, y, width, height, sensor, config):
             max_temp = config.getfloat('TEMPERATURE', 'max_value', fallback=28)
             temp_color = interpolate_color(temp, min_temp, ideal_temp, max_temp)
             temp_text = f"{temp:0.1f}ºC"
+            # Update cache with fresh reading
+            last_temp_value = temp
+            last_temp_text = temp_text
+            last_temp_color = temp_color
+            temp_is_stale = False
+            is_stale = False
     except RuntimeError:
-        log.warning('DHT temperature reading failed')
+        # Sensor reading timed out - use cached value if available
+        if last_temp_text is not None:
+            temp_text = last_temp_text
+            temp_color = last_temp_color
+            temp_is_stale = True
+            is_stale = True
+        else:
+            log.debug('DHT temperature reading failed - no cached value available')
     except Exception as e:
         log.debug(f"Temperature display error: {e}")
+        # Use cached value if available
+        if last_temp_text is not None:
+            temp_text = last_temp_text
+            temp_color = last_temp_color
+            temp_is_stale = True
+            is_stale = True
     
     if not temp_text:
         return img
@@ -414,16 +451,30 @@ def draw_temp_panel(img, font, x, y, width, height, sensor, config):
     # Draw text
     draw.text((temp_x, temp_y), temp_text, font=font, fill='black')
     
+    # Draw red stale indicator line at bottom of panel if data is stale
+    if is_stale:
+        line_y = y + height - 2  # At bottom of panel, 2px from edge (4px line will be inside)
+        draw.line([(x, line_y), (x + width, line_y)], fill=(255, 0, 0), width=4)
+    
     return img
 
 def draw_humi_panel(img, font, x, y, width, height, sensor, config):
-    """Draw humidity as a left-side panel with centered text"""
+    """Draw humidity panel with centered text
+    
+    Background color interpolates from red (too dry/humid) through green (ideal) to red (too extreme)
+    based on configured humidity thresholds.
+    
+    If sensor reading times out, displays last known value with a red stale indicator line.
+    """
+    global last_humi_value, last_humi_text, last_humi_color, humi_is_stale
+    
     draw = ImageDraw.Draw(img)
     
     humi_text = None
     humi_color = None
+    is_stale = False
     
-    # Get humidity
+    # Get humidity - use cached value if sensor times out
     try:
         humi = sensor.humidity
         if humi is not None:
@@ -432,10 +483,29 @@ def draw_humi_panel(img, font, x, y, width, height, sensor, config):
             max_humi = config.getfloat('HUMIDITY', 'max_value', fallback=75)
             humi_color = interpolate_color(humi, min_humi, ideal_humi, max_humi)
             humi_text = f"{humi:0.1f}🌢%"
+            # Update cache with fresh reading
+            last_humi_value = humi
+            last_humi_text = humi_text
+            last_humi_color = humi_color
+            humi_is_stale = False
+            is_stale = False
     except RuntimeError:
-        log.warning('DHT humidity reading failed')
+        # Sensor reading timed out - use cached value if available
+        if last_humi_text is not None:
+            humi_text = last_humi_text
+            humi_color = last_humi_color
+            humi_is_stale = True
+            is_stale = True
+        else:
+            log.debug('DHT humidity reading failed - no cached value available')
     except Exception as e:
         log.debug(f"Humidity display error: {e}")
+        # Use cached value if available
+        if last_humi_text is not None:
+            humi_text = last_humi_text
+            humi_color = last_humi_color
+            humi_is_stale = True
+            is_stale = True
     
     if not humi_text:
         return img
@@ -458,6 +528,11 @@ def draw_humi_panel(img, font, x, y, width, height, sensor, config):
     
     # Draw text
     draw.text((humi_x, humi_y), humi_text, font=font, fill='black')
+    
+    # Draw red stale indicator line at bottom of panel if data is stale
+    if is_stale:
+        line_y = y + height - 2  # At bottom of panel, 2px from edge (4px line will be inside)
+        draw.line([(x, line_y), (x + width, line_y)], fill=(255, 0, 0), width=4)
     
     return img
 
@@ -510,7 +585,11 @@ def signal_handler(signum, frame):
 
 
 def draw_statusbar(car_history, debug_image, config, display, sensor):
-    """Draw status bar on display and log status"""
+    """Draw status bar on display and log status to console
+    
+    The status bar shows green/red indicators for each frame in the car detection history,
+    with green indicating car/suitcase detected and red indicating empty spot.
+    """
     if display is not None:
         display_draw_status(display, car_history, debug_image, config, sensor)
 
@@ -519,29 +598,61 @@ def draw_statusbar(car_history, debug_image, config, display, sensor):
         statusbar = f'{statusbar}✔️ ' if car_present else f'{statusbar}❌ '
     log.debug(statusbar)
 
-def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=None):
-    """Overlay bounding boxes on an existing PIL image (YOLO detections)"""
+def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=None, class_names=None):
+    """Overlay bounding boxes on an existing PIL image (YOLO detections)
+    
+    Args:
+        image_pil: PIL Image to draw on
+        detections: YOLO detection results
+        roi_width: ROI width (unused, kept for compatibility)
+        roi_height: ROI height (unused, kept for compatibility)
+        config: Configuration object (optional)
+        class_names: Dictionary mapping class IDs to names (optional, will use result.names if available)
+    """
     if detections is None:
         return image_pil
     
-    font_size = 24
+    font_size = 48  # Doubled from 24 for better visibility
     font_path = get_font_path(config) if config else "assets/RobotoMonoMedium.ttf"
-    font = load_font(font_path, font_size, log)
+    # Use cached font to avoid reloading every frame (optimization)
+    font = get_cached_font(font_path, font_size, log)
 
     outlinecolor = (0, 0, 0)
     draw = ImageDraw.Draw(image_pil)
 
-    # YOLO detections (COCO classes)
-    # COCO class IDs: 0:person, 2:car, 8:boat, 39:bottle, 56:chair, 62:tv
-    coco_class_names = {0: 'person', 2: 'car', 8: 'boat', 39: 'bottle', 56: 'chair', 62: 'tv'}
-    coco_class_colors = {0: (255, 255, 0), 2: (0, 0, 255), 8: (255, 0, 0), 
-                        39: (0, 255, 0), 56: (255, 0, 255), 62: (0, 255, 255)}
+    # Default class colors (for visual distinction)
+    # Color palette for COCO classes - colors cycle through for classes beyond the palette size
+    default_colors = [
+        (255, 255, 0),    # Yellow
+        (0, 0, 255),      # Blue - car (class 2)
+        (255, 0, 0),      # Red
+        (0, 255, 0),      # Green
+        (255, 0, 255),    # Magenta
+        (0, 255, 255),    # Cyan
+    ]
+    # Extended color palette for more classes
+    extended_colors = [
+        (255, 165, 0),    # Orange
+        (128, 0, 128),    # Purple
+        (255, 192, 203),  # Pink
+        (0, 128, 128),    # Teal
+        (255, 140, 0),    # Dark orange
+        (75, 0, 130),     # Indigo
+    ]
+    all_colors = default_colors + extended_colors
     
     # Process YOLO results
     if detections is not None and len(detections) > 0:
         for result in detections:
             boxes = result.boxes
             if len(boxes) > 0:
+                # Get class names from result object if available (Ultralytics YOLO provides this)
+                result_class_names = None
+                if hasattr(result, 'names') and result.names:
+                    result_class_names = result.names
+                elif class_names:
+                    result_class_names = class_names
+                
                 for i in range(len(boxes)):
                     confidence = float(boxes.conf[i].item() if hasattr(boxes.conf[i], 'item') else boxes.conf[i])
                     class_id = int(boxes.cls[i].item() if hasattr(boxes.cls[i], 'item') else boxes.cls[i])
@@ -551,15 +662,33 @@ def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=
                     x1, y1, x2, y2 = xyxy
                     startX, startY, endX, endY = int(x1), int(y1), int(x2), int(y2)
                     
-                    class_name = coco_class_names.get(class_id, f"Class {class_id}")
-                    label = f"{class_name}: {confidence:.2f}"
-                    class_color = coco_class_colors.get(class_id, (127, 127, 127))
+                    # Get class name from result's names dictionary, or fallback
+                    if result_class_names and class_id in result_class_names:
+                        class_name = result_class_names[class_id]
+                    elif result_class_names and isinstance(result_class_names, (list, tuple)) and class_id < len(result_class_names):
+                        class_name = result_class_names[class_id]
+                    else:
+                        # Fallback to generic class name
+                        class_name = f"Class {class_id}"
+                    
+                    label = f"[{class_id}] {class_name}: {confidence:.2f}"
+                    
+                    # Assign colors based on class type:
+                    # Green for car status triggers (classes that indicate parking spot occupied)
+                    # Yellow for people (person class 0)
+                    # Purple for everything else
+                    if class_id in CAR_STATUS_TRIGGER_CLASSES:
+                        class_color = (0, 255, 0)  # Green
+                    elif class_id == 0:  # Person
+                        class_color = (255, 255, 0)  # Yellow
+                    else:  # All other classes
+                        class_color = (128, 0, 128)  # Purple
                     
                     # Draw bounding box
                     draw.rectangle([(startX, startY), (endX, endY)], outline=class_color, width=2)
                     
                     # Draw text with outline
-                    Δ = 2
+                    Δ = 4  # Outline offset increased proportionally with larger font size
                     captionX = startX + Δ
                     captionY = endY - font_size - Δ
                     # Draw the text outline
@@ -675,7 +804,10 @@ def connect_to_rtsp_stream(rtsp_url, timeout_seconds=10):
         return None
 
 def create_placeholder_image(width, height, config=None):
-    """Create a placeholder image when RTSP is not available"""
+    """Create a placeholder image when video source is not available
+    
+    Used when RTSP stream is disconnected or local video file cannot be read.
+    """
     img = Image.new('RGB', (width, height), color=(64, 64, 64))
     draw = ImageDraw.Draw(img)
     font_path = get_font_path(config) if config else "assets/RobotoMonoMedium.ttf"
@@ -693,6 +825,14 @@ def create_placeholder_image(width, height, config=None):
 # Main execution
 ####################################################################################################
 
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Parking camera monitoring system')
+parser.add_argument('--save-frame', '-s', action='store_true',
+                    help='Capture one frame, process it with all overlays, and save to disk (exits after save)')
+parser.add_argument('--output', '-o', type=str, default='.',
+                    help='Output path for --save-frame (directory path, relative or absolute; default: current working directory). Filename is always snapshot_<timestamp>.png')
+args = parser.parse_args()
+
 # Setup logging (default to INFO level)
 logging.basicConfig(
     level=logging.INFO,
@@ -707,18 +847,36 @@ config = load_config('parkingcam.conf', log)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Initialize display
-display = display_init()
-if display is None:
-    log.warning("Display initialization failed. Continuing without display.")
+# Initialize display (skip in save-frame mode for faster startup)
+display = None
+if not args.save_frame:
+    display = display_init()
+    if display is None:
+        log.warning("Display initialization failed. Continuing without display.")
+else:
+    log.info("Skipping display initialization in save-frame mode")
 
-# Initialize DHT22 sensor (always enabled if available)
+# Initialize DHT22 sensor (skip in save-frame mode to avoid conflicts with background process)
 sensor = None
-try:
-    sensor = adafruit_dht.DHT22(board.D4)
-    log.info("DHT22 sensor initialized")
-except Exception as e:
-    log.warning(f"Failed to initialize DHT22 sensor: {e}. Continuing without sensor.")
+if not args.save_frame:
+    try:
+        sensor = adafruit_dht.DHT22(board.D4)
+        log.info("DHT22 sensor initialized")
+    except Exception as e:
+        log.warning(f"Failed to initialize DHT22 sensor: {e}. Continuing without sensor.")
+else:
+    log.info("Skipping sensor initialization in save-frame mode")
+
+# Sensor reading cache to prevent flicker on timeout
+last_temp_value = None
+last_temp_text = None
+last_temp_color = None
+temp_is_stale = False
+
+last_humi_value = None
+last_humi_text = None
+last_humi_color = None
+humi_is_stale = False
 
 # Load YOLOv11 model
 yolo_model = None
@@ -779,14 +937,14 @@ history_size = config.getint('DETECTION', 'history_size', fallback=120)
 car_present_threshold = config.getint('DETECTION', 'car_present_threshold', fallback=80)
 car_absent_threshold = config.getint('DETECTION', 'car_absent_threshold', fallback=40)
 
-# Parking spot status
-last_cv_time = time.time()
-car_history = []
+# Parking spot detection state
+last_cv_time = time.time()  # Timestamp of last CV processing run
+car_history = []  # History buffer of detection results (True=car/suitcase detected, False=empty)
 
 # Shared state for display and CV results (updated by CV thread, read by display loop)
-latest_detections = None
-latest_detection_frame_size = None  # (width, height) for coordinate scaling
-cv_processing = False  # Flag to prevent multiple CV threads
+latest_detections = None  # YOLO detection results for bounding box overlay
+latest_detection_frame_size = None  # (width, height) tuple for coordinate scaling
+cv_processing = False  # Flag to prevent multiple concurrent CV processing threads
 display_lock = None
 try:
     import threading
@@ -795,11 +953,39 @@ try:
 except ImportError:
     HAS_THREADING = False
 
+# Font cache to avoid reloading fonts on every frame (optimization for RPi)
+_font_cache = {}
+
+def get_cached_font(font_path, size, logger=None):
+    """Get font from cache or load it if not cached (optimization for RPi)"""
+    cache_key = (font_path, size)
+    if cache_key not in _font_cache:
+        _font_cache[cache_key] = load_font(font_path, size, logger)
+    return _font_cache[cache_key]
+
+# Cached font metrics for display calculations (calculated once per display size change)
+_cached_font_metrics = {}
+
 
 def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, 
                          yolo_model, confidence_threshold):
     """Process a frame with YOLO detection (runs in separate thread or at intervals)
-    Returns: (car_detected, detections, frame_size) where detections can be used for overlay
+    
+    Detects objects in CAR_STATUS_TRIGGER_CLASSES (currently car and suitcase) in the frame or ROI.
+    Only these classes trigger the parking spot "occupied" status.
+    
+    Args:
+        frame: OpenCV frame (numpy array)
+        use_full_frame: If True, use entire frame; if False, extract ROI first
+        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (only used if use_full_frame=False)
+        yolo_model: YOLOv11 model instance
+        confidence_threshold: Minimum confidence for detections (0.0-1.0)
+    
+    Returns:
+        Tuple of (car_detected, detections, frame_size):
+        - car_detected: Boolean indicating if car/suitcase was detected
+        - detections: YOLO detection results (for bounding box overlay)
+        - frame_size: (width, height) tuple of the detection region
     """
     try:
         car_detected = False
@@ -814,36 +1000,43 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         else:
             # Extract ROI from frame (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
-            # Validate ROI bounds
-            if roi_x < 0 or roi_y < 0 or roi_x + roi_w > frame_w or roi_y + roi_h > frame_h:
-                log.warning(f"ROI bounds out of range: frame={frame_w}x{frame_h}, ROI=({roi_x},{roi_y},{roi_w},{roi_h}). Clamping ROI.")
-                roi_x = max(0, min(roi_x, frame_w - 1))
-                roi_y = max(0, min(roi_y, frame_h - 1))
-                roi_w = min(roi_w, frame_w - roi_x)
-                roi_h = min(roi_h, frame_h - roi_y)
+            # Store original ROI values for logging
+            original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
+            # Validate and clamp ROI bounds to ensure they fit within frame
+            # Clamp ROI width/height first to frame dimensions, then clamp position
+            roi_w = max(1, min(roi_w, frame_w))  # Ensure at least 1 pixel wide
+            roi_h = max(1, min(roi_h, frame_h))  # Ensure at least 1 pixel tall
+            # Clamp position to ensure ROI fits within frame
+            roi_x = max(0, min(roi_x, frame_w - roi_w))
+            roi_y = max(0, min(roi_y, frame_h - roi_h))
+            # Log warning if bounds were adjusted
+            if roi_x != original_roi_x or roi_y != original_roi_y or roi_w != original_roi_w or roi_h != original_roi_h:
+                log.warning(f"ROI bounds adjusted in CV: frame={frame_w}x{frame_h}, original=({original_roi_x},{original_roi_y},{original_roi_w},{original_roi_h}), clamped=({roi_x},{roi_y},{roi_w},{roi_h})")
             
             detection_frame = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w].copy()
             frame_h, frame_w = roi_h, roi_w
             frame_size = (frame_w, frame_h)
         
         # YOLO detection (COCO classes)
-        # COCO class IDs: 0:person, 2:car, 8:boat, 39:bottle, 56:chair, 62:tv
+        # Check for classes defined in CAR_STATUS_TRIGGER_CLASSES for parking spot occupancy
         if yolo_model is not None:
+            # Run YOLO detection (imgsz auto-detected from frame size for optimal performance)
             results = yolo_model(detection_frame, conf=confidence_threshold, verbose=False)
             detections = results
             
-            # Check for relevant classes (lighting/reflection workaround)
+            # Check for classes that trigger parking spot occupancy (early exit for performance)
             for result in results:
                 boxes = result.boxes
                 if len(boxes) > 0:
-                    for i in range(len(boxes)):
-                        class_id = int(boxes.cls[i].item() if hasattr(boxes.cls[i], 'item') else boxes.cls[i])
-                        confidence = float(boxes.conf[i].item() if hasattr(boxes.conf[i], 'item') else boxes.conf[i])
-                        # COCO classes: 0:person, 2:car, 8:boat, 39:bottle, 56:chair, 62:tv
-                        if class_id in [0, 2, 8, 39, 56, 62]:
-                            car_detected = True
-                            break
-                    if car_detected:
+                    # Convert to numpy once for better performance
+                    if hasattr(boxes.cls, 'cpu'):
+                        class_ids = boxes.cls.cpu().numpy()
+                    else:
+                        class_ids = boxes.cls.numpy()
+                    
+                    # Check if any detected class is in trigger classes (vectorized check)
+                    if any(int(cid) in CAR_STATUS_TRIGGER_CLASSES for cid in class_ids):
+                        car_detected = True
                         break
         
         return car_detected, detections, frame_size
@@ -856,7 +1049,20 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         return False, None, (frame_w, frame_h)
 
 def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=None):
-    """Prepare frame for display (without CV processing)"""
+    """Prepare frame for display (without CV processing)
+    
+    Extracts ROI if needed and converts OpenCV BGR format to PIL RGB format.
+    Performs bounds validation and clamping to ensure ROI fits within frame.
+    
+    Args:
+        frame: OpenCV frame (numpy array) or None
+        use_full_frame: If True, use entire frame; if False, extract ROI
+        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates
+        config: Configuration object (optional)
+    
+    Returns:
+        PIL Image ready for display, or placeholder image if frame is None
+    """
     if frame is None:
         if use_full_frame:
             return create_placeholder_image(640, 480, config)
@@ -871,13 +1077,18 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
         else:
             # Extract ROI and convert to PIL Image (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
-            # Validate ROI bounds
-            if roi_x < 0 or roi_y < 0 or roi_x + roi_w > frame_w or roi_y + roi_h > frame_h:
-                log.warning(f"ROI bounds out of range in display: frame={frame_w}x{frame_h}, ROI=({roi_x},{roi_y},{roi_w},{roi_h}). Clamping ROI.")
-                roi_x = max(0, min(roi_x, frame_w - 1))
-                roi_y = max(0, min(roi_y, frame_h - 1))
-                roi_w = min(roi_w, frame_w - roi_x)
-                roi_h = min(roi_h, frame_h - roi_y)
+            # Store original ROI values for logging
+            original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
+            # Validate and clamp ROI bounds to ensure they fit within frame
+            # Clamp ROI width/height first to frame dimensions, then clamp position
+            roi_w = max(1, min(roi_w, frame_w))  # Ensure at least 1 pixel wide
+            roi_h = max(1, min(roi_h, frame_h))  # Ensure at least 1 pixel tall
+            # Clamp position to ensure ROI fits within frame
+            roi_x = max(0, min(roi_x, frame_w - roi_w))
+            roi_y = max(0, min(roi_y, frame_h - roi_h))
+            # Log warning if bounds were adjusted
+            if roi_x != original_roi_x or roi_y != original_roi_y or roi_w != original_roi_w or roi_h != original_roi_h:
+                log.warning(f"ROI bounds adjusted in display: frame={frame_w}x{frame_h}, original=({original_roi_x},{original_roi_y},{original_roi_w},{original_roi_h}), clamped=({roi_x},{roi_y},{roi_w},{roi_h})")
             
             roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
             roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
@@ -892,7 +1103,16 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
 def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                         yolo_model, confidence_threshold,
                         car_history, history_size, car_present_threshold, car_absent_threshold):
-    """Background thread function for CV processing"""
+    """Background thread function for CV processing
+    
+    Runs YOLO detection on a frame and updates shared state:
+    - latest_detections: Detection results for bounding box overlay
+    - latest_detection_frame_size: Size of the detection region
+    - car_history: History buffer of car detection results (thread-safe)
+    
+    Note: car_present_threshold and car_absent_threshold are not used here,
+    they are applied later when evaluating the car_history buffer.
+    """
     global latest_detections, latest_detection_frame_size, cv_processing
     
     try:
@@ -925,6 +1145,105 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         log.error(f"Error in CV processing thread: {e}")
     finally:
         cv_processing = False
+
+# If save-frame mode, capture one frame and exit (no display hardware needed)
+if args.save_frame:
+    log.info("Running in save-frame mode (single capture)...")
+    
+    # Use display dimensions from config or defaults (240x280 for 1.69" LCD)
+    # Display initialization is optional in save mode
+    display_width = display.width if display and hasattr(display, 'width') else 240
+    display_height = display.height if display and hasattr(display, 'height') else 280
+    
+    # Try to read one frame
+    if cap is not None:
+        try:
+            # Set read timeout before reading (RTSP can block indefinitely otherwise)
+            log.info("Setting read timeout and attempting to capture frame...")
+            if rtsp_url is not None:
+                # For RTSP streams, set read timeout
+                timeout_ms = rtsp_timeout * 1000
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+                os.environ['OPENCV_FFMPEG_READ_TIMEOUT_MSEC'] = str(timeout_ms)
+            
+            with suppress_stderr():
+                log.info("Reading frame from video source...")
+                ret, frame = cap.read()
+        except KeyboardInterrupt:
+            log.info("Interrupted by user during frame capture")
+            if cap is not None:
+                cap.release()
+            display_exit(display)
+            sys.exit(0)
+        except Exception as e:
+            log.error(f"Error reading frame: {e}")
+            ret = False
+            frame = None
+        
+        if ret and frame is not None:
+            log.info(f"Frame captured successfully ({frame.shape[1]}x{frame.shape[0]})")
+            # Prepare base image (ROI extraction if needed)
+            display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config)
+            
+            # Run CV detection synchronously for bounding boxes
+            log.info("Running YOLO detection...")
+            try:
+                car_detected, detections, frame_size = process_cv_detection(
+                    frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
+                    yolo_model, confidence_threshold
+                )
+                log.info(f"Detection complete: car_detected={car_detected}")
+            except KeyboardInterrupt:
+                log.info("Interrupted by user during detection")
+                if cap is not None:
+                    cap.release()
+                display_exit(display)
+                sys.exit(0)
+            except Exception as e:
+                log.error(f"Error during detection: {e}")
+                car_detected = False
+                detections = None
+                frame_size = None
+            
+            # Overlay bounding boxes if available (save-frame mode: just frame + bounding boxes, no UI)
+            if detections is not None and frame_size is not None:
+                display_w, display_h = display_image.size
+                det_w, det_h = frame_size
+                if display_w == det_w and display_h == det_h:
+                    class_names = yolo_model.names if yolo_model and hasattr(yolo_model, 'names') else None
+                    display_image = overlay_bounding_boxes(
+                        display_image, detections, display_w, display_h, config=config, class_names=class_names
+                    )
+            
+            # Save the image with bounding boxes (no statusbar, clock, or temp/humidity)
+            # Generate output filename (always snapshot_<timestamp>.png)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"snapshot_{timestamp}.png"
+            
+            # args.output can be a relative or absolute path
+            output_dir = args.output
+            
+            # Create output directory if needed
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Construct full path
+            output_path = os.path.join(output_dir, filename)
+            
+            # Save the frame with bounding boxes
+            log.info(f"Saving frame to: {output_path}")
+            display_image.save(output_path, "PNG")
+            log.info(f"Saved frame to: {output_path}")
+        else:
+            log.error("Failed to read frame for saving (timeout or stream error)")
+    else:
+        log.error("No video source available for frame capture")
+    
+    # Cleanup and exit
+    log.info("Cleaning up and exiting...")
+    if cap is not None:
+        cap.release()
+    display_exit(display)
+    sys.exit(0)
 
 log.info("Starting parking spot monitoring...")
 
@@ -1076,15 +1395,18 @@ try:
             current_detection_frame_size = latest_detection_frame_size
         
         # Overlay bounding boxes if we have detections and frame sizes match
+        # Size matching ensures bounding boxes align correctly with the displayed image
         if current_detections is not None and current_detection_frame_size is not None:
             # Get display image dimensions
             display_w, display_h = display_image.size
             det_w, det_h = current_detection_frame_size
             
-            # Only overlay if dimensions match (same region)
+            # Only overlay if dimensions match (ensures bounding boxes align correctly)
             if display_w == det_w and display_h == det_h:
+                # Pass model's class names if available
+                class_names = yolo_model.names if yolo_model and hasattr(yolo_model, 'names') else None
                 display_image = overlay_bounding_boxes(
-                    display_image, current_detections, display_w, display_h, config=config
+                    display_image, current_detections, display_w, display_h, config=config, class_names=class_names
                 )
         
         # Display the image with statusbar (thread-safe read of car_history)
@@ -1095,8 +1417,9 @@ try:
             current_car_history = car_history
         draw_statusbar(current_car_history, display_image, config, display, sensor)
 
-        # Small sleep to prevent tight loop (allows ~30fps display)
-        time.sleep(0.033)  # ~30fps
+        # Small sleep to prevent tight loop (reduced to ~15fps for better RPi performance)
+        # 15fps is sufficient for status display and reduces CPU load significantly
+        time.sleep(0.067)  # ~15fps (optimized for RPi)
 
 except KeyboardInterrupt:
     log.info("Interrupted by user")
