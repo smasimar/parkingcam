@@ -687,17 +687,25 @@ def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=
                     # Draw bounding box
                     draw.rectangle([(startX, startY), (endX, endY)], outline=class_color, width=2)
                     
-                    # Draw text with outline
-                    Δ = 4  # Outline offset increased proportionally with larger font size
-                    captionX = startX + Δ
-                    captionY = endY - font_size - Δ
-                    # Draw the text outline
-                    draw.text((captionX - Δ, captionY - Δ), label, font=font, fill=outlinecolor)
-                    draw.text((captionX + Δ, captionY - Δ), label, font=font, fill=outlinecolor)
-                    draw.text((captionX - Δ, captionY + Δ), label, font=font, fill=outlinecolor)
-                    draw.text((captionX + Δ, captionY + Δ), label, font=font, fill=outlinecolor)
-                    # Draw the text over it
-                    draw.text((captionX, captionY), label, font=font, fill=class_color)
+                    # Draw text with outline (better quality for small screens)
+                    outline_width = max(1, font_size // 16)  # Proportional outline width
+                    captionX = startX + outline_width
+                    captionY = endY - font_size - outline_width
+                    
+                    # Try using PIL's built-in stroke support (Pillow 8.0.0+)
+                    # This creates a smooth, professional outline
+                    try:
+                        draw.text((captionX, captionY), label, font=font, fill=class_color,
+                                 stroke_width=outline_width, stroke_fill=outlinecolor)
+                    except TypeError:
+                        # Fallback for older PIL versions: draw outline in 8 directions
+                        # This creates a smoother outline than the previous 4-offset method
+                        offsets = [(-1,-1), (0,-1), (1,-1), (-1,0), (1,0), (-1,1), (0,1), (1,1)]
+                        for dx, dy in offsets:
+                            draw.text((captionX + dx * outline_width, captionY + dy * outline_width), 
+                                     label, font=font, fill=outlinecolor)
+                        # Draw the text over it
+                        draw.text((captionX, captionY), label, font=font, fill=class_color)
 
     return image_pil
 
@@ -828,7 +836,11 @@ def create_placeholder_image(width, height, config=None):
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Parking camera monitoring system')
 parser.add_argument('--save-frame', '-s', action='store_true',
-                    help='Capture one frame, process it with all overlays, and save to disk (exits after save)')
+                    help='Capture frame(s), process with bounding boxes, and save to disk (exits after save)')
+parser.add_argument('--count', '-c', type=int, default=1, metavar='N',
+                    help='Number of frames to capture when using --save-frame (default: 1)')
+parser.add_argument('--interval', '-t', type=float, default=0.0, metavar='SECONDS',
+                    help='Time interval in seconds between frame captures when using --save-frame (default: 0)')
 parser.add_argument('--output', '-o', type=str, default='.',
                     help='Output path for --save-frame (directory path, relative or absolute; default: current working directory). Filename is always snapshot_<timestamp>.png')
 args = parser.parse_args()
@@ -1146,100 +1158,126 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
     finally:
         cv_processing = False
 
-# If save-frame mode, capture one frame and exit (no display hardware needed)
+# If save-frame mode, capture frame(s) and exit (no display hardware needed)
 if args.save_frame:
-    log.info("Running in save-frame mode (single capture)...")
+    frame_count = max(1, args.count)  # Ensure at least 1 frame
+    interval = max(0.0, args.interval)  # Ensure non-negative interval
+    
+    if frame_count == 1:
+        log.info("Running in save-frame mode (single capture)...")
+    else:
+        log.info(f"Running in save-frame mode ({frame_count} frames, {interval}s interval)...")
     
     # Use display dimensions from config or defaults (240x280 for 1.69" LCD)
     # Display initialization is optional in save mode
     display_width = display.width if display and hasattr(display, 'width') else 240
     display_height = display.height if display and hasattr(display, 'height') else 280
     
-    # Try to read one frame
+    # Set read timeout before reading (RTSP can block indefinitely otherwise)
+    if rtsp_url is not None and cap is not None:
+        timeout_ms = rtsp_timeout * 1000
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+        os.environ['OPENCV_FFMPEG_READ_TIMEOUT_MSEC'] = str(timeout_ms)
+    
+    saved_count = 0
+    
+    # Capture specified number of frames
     if cap is not None:
-        try:
-            # Set read timeout before reading (RTSP can block indefinitely otherwise)
-            log.info("Setting read timeout and attempting to capture frame...")
-            if rtsp_url is not None:
-                # For RTSP streams, set read timeout
-                timeout_ms = rtsp_timeout * 1000
-                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
-                os.environ['OPENCV_FFMPEG_READ_TIMEOUT_MSEC'] = str(timeout_ms)
-            
-            with suppress_stderr():
-                log.info("Reading frame from video source...")
-                ret, frame = cap.read()
-        except KeyboardInterrupt:
-            log.info("Interrupted by user during frame capture")
-            if cap is not None:
-                cap.release()
-            display_exit(display)
-            sys.exit(0)
-        except Exception as e:
-            log.error(f"Error reading frame: {e}")
-            ret = False
-            frame = None
-        
-        if ret and frame is not None:
-            log.info(f"Frame captured successfully ({frame.shape[1]}x{frame.shape[0]})")
-            # Prepare base image (ROI extraction if needed)
-            display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config)
-            
-            # Run CV detection synchronously for bounding boxes
-            log.info("Running YOLO detection...")
+        for frame_num in range(1, frame_count + 1):
             try:
-                car_detected, detections, frame_size = process_cv_detection(
-                    frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                    yolo_model, confidence_threshold
-                )
-                log.info(f"Detection complete: car_detected={car_detected}")
+                if frame_count > 1:
+                    log.info(f"Capturing frame {frame_num}/{frame_count}...")
+                else:
+                    log.info("Setting read timeout and attempting to capture frame...")
+                
+                # Read frame
+                with suppress_stderr():
+                    log.info("Reading frame from video source...")
+                    ret, frame = cap.read()
             except KeyboardInterrupt:
-                log.info("Interrupted by user during detection")
+                log.info(f"Interrupted by user during frame capture (saved {saved_count} frame(s))")
                 if cap is not None:
                     cap.release()
                 display_exit(display)
                 sys.exit(0)
             except Exception as e:
-                log.error(f"Error during detection: {e}")
-                car_detected = False
-                detections = None
-                frame_size = None
+                log.error(f"Error reading frame: {e}")
+                ret = False
+                frame = None
             
-            # Overlay bounding boxes if available (save-frame mode: just frame + bounding boxes, no UI)
-            if detections is not None and frame_size is not None:
-                display_w, display_h = display_image.size
-                det_w, det_h = frame_size
-                if display_w == det_w and display_h == det_h:
-                    class_names = yolo_model.names if yolo_model and hasattr(yolo_model, 'names') else None
-                    display_image = overlay_bounding_boxes(
-                        display_image, detections, display_w, display_h, config=config, class_names=class_names
+            if ret and frame is not None:
+                log.info(f"Frame {frame_num} captured successfully ({frame.shape[1]}x{frame.shape[0]})")
+                # Prepare base image (ROI extraction if needed)
+                display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config)
+                
+                # Run CV detection synchronously for bounding boxes
+                log.info("Running YOLO detection...")
+                try:
+                    car_detected, detections, frame_size = process_cv_detection(
+                        frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
+                        yolo_model, confidence_threshold
                     )
+                    log.info(f"Detection complete: car_detected={car_detected}")
+                except KeyboardInterrupt:
+                    log.info(f"Interrupted by user during detection (saved {saved_count} frame(s))")
+                    if cap is not None:
+                        cap.release()
+                    display_exit(display)
+                    sys.exit(0)
+                except Exception as e:
+                    log.error(f"Error during detection: {e}")
+                    car_detected = False
+                    detections = None
+                    frame_size = None
+                
+                # Overlay bounding boxes if available (save-frame mode: just frame + bounding boxes, no UI)
+                if detections is not None and frame_size is not None:
+                    display_w, display_h = display_image.size
+                    det_w, det_h = frame_size
+                    if display_w == det_w and display_h == det_h:
+                        class_names = yolo_model.names if yolo_model and hasattr(yolo_model, 'names') else None
+                        display_image = overlay_bounding_boxes(
+                            display_image, detections, display_w, display_h, config=config, class_names=class_names
+                        )
+                
+                # Save the image with bounding boxes (no statusbar, clock, or temp/humidity)
+                # Generate output filename (always snapshot_<timestamp>.png)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"snapshot_{timestamp}.png"
+                
+                # args.output can be a relative or absolute path
+                output_dir = args.output
+                
+                # Create output directory if needed
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Construct full path
+                output_path = os.path.join(output_dir, filename)
+                
+                # Save the frame with bounding boxes
+                log.info(f"Saving frame {frame_num} to: {output_path}")
+                display_image.save(output_path, "PNG")
+                log.info(f"Saved frame {frame_num} to: {output_path}")
+                saved_count += 1
+            else:
+                log.error(f"Failed to read frame {frame_num} for saving (timeout or stream error)")
             
-            # Save the image with bounding boxes (no statusbar, clock, or temp/humidity)
-            # Generate output filename (always snapshot_<timestamp>.png)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"snapshot_{timestamp}.png"
-            
-            # args.output can be a relative or absolute path
-            output_dir = args.output
-            
-            # Create output directory if needed
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Construct full path
-            output_path = os.path.join(output_dir, filename)
-            
-            # Save the frame with bounding boxes
-            log.info(f"Saving frame to: {output_path}")
-            display_image.save(output_path, "PNG")
-            log.info(f"Saved frame to: {output_path}")
-        else:
-            log.error("Failed to read frame for saving (timeout or stream error)")
+            # Wait for interval before next capture (skip on last frame)
+            if frame_num < frame_count and interval > 0:
+                log.info(f"Waiting {interval} seconds before next capture...")
+                try:
+                    time.sleep(interval)
+                except KeyboardInterrupt:
+                    log.info(f"Interrupted during wait (saved {saved_count} frame(s))")
+                    if cap is not None:
+                        cap.release()
+                    display_exit(display)
+                    sys.exit(0)
     else:
         log.error("No video source available for frame capture")
     
     # Cleanup and exit
-    log.info("Cleaning up and exiting...")
+    log.info(f"Completed: saved {saved_count}/{frame_count} frame(s). Cleaning up and exiting...")
     if cap is not None:
         cap.release()
     display_exit(display)
