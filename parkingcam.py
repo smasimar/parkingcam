@@ -113,7 +113,8 @@ def get_default_config():
     config = configparser.ConfigParser()
     config['RTSP'] = {'url': '', 'timeout': '10'}
     config['VIDEO'] = {'use_local_file': 'false', 'local_file_path': ''}
-    config['ROI'] = {'point_x': '750', 'point_y': '400', 'quadrant': '4', 'use_full_frame': 'false'}
+    config['ROI'] = {'roi_method': 'point_quadrant', 'point_x': '450', 'point_y': '400', 'quadrant': '4',
+                     'x': '800', 'y': '500', 'width': '550', 'height': '580', 'use_full_frame': 'false'}
     config['TEMPERATURE'] = {'enabled': 'false', 'min_value': '16', 'ideal_value': '22', 'max_value': '28'}
     config['HUMIDITY'] = {'enabled': 'false', 'min_value': '25', 'ideal_value': '50', 'max_value': '75'}
     config['DETECTION'] = {'confidence_threshold': '0.4', 'history_size': '120', 
@@ -964,11 +965,31 @@ else:
         rtsp_timeout = config.getint('RTSP', 'timeout', fallback=10)
         cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
 
-# Get ROI configuration (point + quadrant)
-roi_point_x = config.getint('ROI', 'point_x', fallback=750)
-roi_point_y = config.getint('ROI', 'point_y', fallback=400)
-roi_quadrant = config.getint('ROI', 'quadrant', fallback=4)
+# Get ROI configuration
+roi_method = config.get('ROI', 'roi_method', fallback='point_quadrant').strip().lower()
 use_full_frame = get_config_bool(config, 'ROI', 'use_full_frame', fallback=False)
+
+# ROI configuration based on method
+if roi_method == 'coordinates':
+    # Use explicit coordinates (x, y, width, height)
+    roi_x = config.getint('ROI', 'x', fallback=800)
+    roi_y = config.getint('ROI', 'y', fallback=500)
+    roi_w = config.getint('ROI', 'width', fallback=550)
+    roi_h = config.getint('ROI', 'height', fallback=580)
+    roi_point_x = None
+    roi_point_y = None
+    roi_quadrant = None
+    log.info(f"ROI method: coordinates - x={roi_x}, y={roi_y}, width={roi_w}, height={roi_h}")
+else:
+    # Use point + quadrant (default or if method is 'point_quadrant')
+    roi_point_x = config.getint('ROI', 'point_x', fallback=450)
+    roi_point_y = config.getint('ROI', 'point_y', fallback=400)
+    roi_quadrant = config.getint('ROI', 'quadrant', fallback=4)
+    roi_x = None
+    roi_y = None
+    roi_w = None
+    roi_h = None
+    log.info(f"ROI method: point_quadrant - point=({roi_point_x},{roi_point_y}), quadrant={roi_quadrant}")
 
 # ROI will be calculated from point + quadrant when we have frame dimensions
 # Function to calculate ROI coordinates from point + quadrant
@@ -1024,11 +1045,9 @@ def calculate_roi_from_point_quadrant(point_x, point_y, quadrant, frame_width, f
     
     return x, y, width, height
 
-# ROI coordinates will be calculated dynamically based on frame dimensions
-roi_x = None
-roi_y = None
-roi_w = None
-roi_h = None
+# ROI coordinates are now set above based on roi_method
+# If using point_quadrant, roi_x/roi_y/roi_w/roi_h will be None initially and calculated dynamically
+# If using coordinates, roi_x/roi_y/roi_w/roi_h are set directly from config
 
 cv_interval = config.getfloat('DETECTION', 'cv_interval', fallback=1.0)
 confidence_threshold = config.getfloat('DETECTION', 'confidence_threshold', fallback=0.4)
