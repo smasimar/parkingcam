@@ -165,7 +165,7 @@ def get_rtsp_url(config):
 
 # COCO class IDs that trigger parking spot "occupied" status
 # These classes indicate a vehicle or large object is in the parking spot
-CAR_STATUS_TRIGGER_CLASSES = [2, 8, 28]  # 2=car, 8=boat, 28=suitcase
+CAR_STATUS_TRIGGER_CLASSES = [2, 7, 8, 28]  # 2=car, 7=truck, 8=boat, 28=suitcase
 
 ####################################################################################################
 # RPi DHT sensor and SPI display related function definitions
@@ -191,7 +191,7 @@ def display_init():
         log.error(f"Unexpected error during display initialization: {e}")
         return None
 
-def build_display_canvas(car_image, car_history, config, sensor=None, display_width=240, display_height=280):
+def build_display_canvas(car_image, car_history, config, sensor=None, display_width=240, display_height=280, rtsp_reconnect_info=None):
     """Build complete display canvas with all overlays
     
     This function builds the complete image with statusbar, clock, temp/humidity, and video.
@@ -204,6 +204,7 @@ def build_display_canvas(car_image, car_history, config, sensor=None, display_wi
         sensor: DHT22 sensor object (optional)
         display_width: Display width in pixels (default 240 for 1.69" LCD)
         display_height: Display height in pixels (default 280 for 1.69" LCD)
+        rtsp_reconnect_info: Thread-safe reference to reconnection info dict (list with single dict, optional)
     
     Returns:
         PIL Image canvas with all overlays applied
@@ -259,32 +260,117 @@ def build_display_canvas(car_image, car_history, config, sensor=None, display_wi
         available_height = display_height - video_start_y  # Remaining height below clock
         available_width = display_width
         
-        # Note: car_image is already processed (ROI extracted if needed) by prepare_display_image()
-        # So we just need to scale and position it for display, regardless of use_full_frame setting
-        # Fit to height: scale video to match available height, crop sides if needed
-        scale = available_height / height
-        new_height = available_height
-        new_width = int(width * scale)
+        # Check if this is a placeholder image (all black = no video source)
+        # Sample a few pixels to see if image is entirely black
+        is_placeholder = True
+        sample_points = [(0, 0), (width//2, height//2), (width-1, height-1), (0, height-1), (width-1, 0)]
+        for px, py in sample_points:
+            if px < width and py < height:
+                pixel = car_image.getpixel((px, py))
+                if pixel != (0, 0, 0):  # Not black
+                    is_placeholder = False
+                    break
         
-        # Resize maintaining aspect ratio
-        # Use BILINEAR instead of LANCZOS for better performance on RPi (quality still good)
-        car_image = car_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
-        
-        # If scaled width is wider than screen, crop sides (center crop horizontally)
-        if new_width > available_width:
-            crop_left = (new_width - available_width) // 2
-            car_image = car_image.crop((crop_left, 0, crop_left + available_width, new_height))
-            x_offset = 0
+        if is_placeholder:
+            # Show reconnection info instead of pasting image
+            draw = ImageDraw.Draw(canvas)
+            # Use medium-sized font for placeholder text
+            placeholder_font = get_cached_font(font_path, 20, log)
+            
+            # Get reconnection info (thread-safe read)
+            reconnect_info = None
+            if rtsp_reconnect_info is not None:
+                try:
+                    # Assume it's a list reference, get the dict
+                    info_ref = rtsp_reconnect_info[0] if isinstance(rtsp_reconnect_info, list) else rtsp_reconnect_info
+                    reconnect_info = info_ref.copy()  # Copy to avoid thread issues
+                except:
+                    reconnect_info = None
+            
+            # Build placeholder text with reconnection info
+            if reconnect_info and reconnect_info.get('status') != 'connected':
+                attempt_count = reconnect_info.get('attempt_count', 0)
+                status = reconnect_info.get('status', 'disconnected')
+                last_attempt = reconnect_info.get('last_attempt_time')
+                
+                # Calculate time since last attempt
+                time_since = ""
+                if last_attempt:
+                    elapsed = int(time.time() - last_attempt)
+                    if elapsed < 60:
+                        time_since = f"{elapsed}s ago"
+                    else:
+                        minutes = elapsed // 60
+                        time_since = f"{minutes}m ago"
+                
+                # Format text based on status
+                if status == 'attempting':
+                    placeholder_text = f"Reconnecting...\nAttempt #{attempt_count}"
+                elif status == 'failed':
+                    placeholder_text = f"Connection\nFailed\nAttempt #{attempt_count}"
+                    if time_since:
+                        placeholder_text += f"\n{time_since}"
+                else:
+                    placeholder_text = f"RTSP\nDisconnected\nAttempt #{attempt_count}"
+                    if time_since:
+                        placeholder_text += f"\n{time_since}"
+            else:
+                placeholder_text = "No RTSP\nStream"
+            
+            # Calculate text dimensions (multi-line)
+            lines = placeholder_text.split('\n')
+            line_heights = []
+            line_widths = []
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=placeholder_font)
+                line_widths.append(bbox[2] - bbox[0])
+                line_heights.append(bbox[3] - bbox[1])
+            
+            total_height = sum(line_heights) + (len(lines) - 1) * 4  # 4px spacing between lines
+            
+            # Calculate center position, accounting for sensor bar offset
+            # Center vertically in available video area, but offset up from sensor bar
+            video_area_height = available_height - sensor_panel_height
+            text_y = video_start_y + sensor_panel_height + (video_area_height - total_height) // 2
+            
+            # Draw each line of text, center-aligned individually
+            current_y = text_y
+            for i, line in enumerate(lines):
+                line_bbox = draw.textbbox((0, 0), line, font=placeholder_font)
+                line_left = line_bbox[0]
+                line_top = line_bbox[1]
+                line_width = line_widths[i]
+                # Center each line individually based on its width
+                line_x = (display_width - line_width) // 2 - line_left
+                draw.text((line_x, current_y - line_top), line, font=placeholder_font, fill=(255, 255, 255))
+                current_y += line_heights[i] + 4  # Move to next line with 4px spacing
         else:
-            # If scaled width is narrower, center it
-            x_offset = (available_width - new_width) // 2
+            # Note: car_image is already processed (ROI extracted if needed) by prepare_display_image()
+            # So we just need to scale and position it for display, regardless of use_full_frame setting
+            # Fit to height: scale video to match available height, crop sides if needed
+            scale = available_height / height
+            new_height = available_height
+            new_width = int(width * scale)
+            
+            # Resize maintaining aspect ratio
+            # Use BILINEAR instead of LANCZOS for better performance on RPi (quality still good)
+            car_image = car_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+            
+            # If scaled width is wider than screen, crop sides (center crop horizontally)
+            if new_width > available_width:
+                crop_left = (new_width - available_width) // 2
+                car_image = car_image.crop((crop_left, 0, crop_left + available_width, new_height))
+                x_offset = 0
+            else:
+                # If scaled width is narrower, center it
+                x_offset = (available_width - new_width) // 2
+            
+            # Position below clock
+            y_offset = video_start_y
+
+            # Paste the processed image (full screen)
+            canvas.paste(car_image, (x_offset, y_offset))
         
-        # Position below clock
-        y_offset = video_start_y
-
-        # Paste the processed image (full screen)
-        canvas.paste(car_image, (x_offset, y_offset))
-
         draw = ImageDraw.Draw(canvas)
         # Draw status bar if enabled
         if get_config_bool(config, 'DETECTION', 'show_statusbar', fallback=True):
@@ -316,14 +402,14 @@ def build_display_canvas(car_image, car_history, config, sensor=None, display_wi
         log.error(f"Error building display canvas: {e}")
         return None
 
-def display_draw_status(disp, car_history, car_image, config, sensor=None):
+def display_draw_status(disp, car_history, car_image, config, sensor=None, rtsp_reconnect_info=None):
     """Draw status on the display"""
     if disp is None:
         return
     
     try:
         # Build canvas using extracted function
-        canvas = build_display_canvas(car_image, car_history, config, sensor, disp.width, disp.height)
+        canvas = build_display_canvas(car_image, car_history, config, sensor, disp.width, disp.height, rtsp_reconnect_info)
         if canvas is not None:
             disp.ShowImage(canvas)
     except Exception as e:
@@ -613,14 +699,14 @@ def signal_handler(signum, frame):
     shutdown_flag = True
 
 
-def draw_statusbar(car_history, debug_image, config, display, sensor):
+def draw_statusbar(car_history, debug_image, config, display, sensor, rtsp_reconnect_info=None):
     """Draw status bar on display and log status to console
     
     The status bar shows green/red indicators for each frame in the car detection history,
     with green indicating car/suitcase detected and red indicating empty spot.
     """
     if display is not None:
-        display_draw_status(display, car_history, debug_image, config, sensor)
+        display_draw_status(display, car_history, debug_image, config, sensor, rtsp_reconnect_info)
 
     statusbar = ''
     for i, car_present in enumerate(car_history):
@@ -841,22 +927,79 @@ def connect_to_rtsp_stream(rtsp_url, timeout_seconds=10):
         return None
 
 def create_placeholder_image(width, height, config=None):
-    """Create a placeholder image when video source is not available
+    """Create a minimal placeholder image when video source is not available
     
-    Used when RTSP stream is disconnected or local video file cannot be read.
+    Returns a black image that will be replaced with "No RTSP Stream" text in build_display_canvas.
     """
-    img = Image.new('RGB', (width, height), color=(64, 64, 64))
-    draw = ImageDraw.Draw(img)
-    font_path = get_font_path(config) if config else "assets/RobotoMonoMedium.ttf"
-    font = load_font(font_path, 32, log)
+    return Image.new('RGB', (width, height), color=(0, 0, 0))
+
+def rtsp_reconnection_thread(rtsp_url, rtsp_timeout, rtsp_cap_lock, rtsp_cap_ref, rtsp_reconnect_info):
+    """Background thread that continuously attempts to reconnect to RTSP stream
     
-    text = "No RTSP Stream"
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    position = ((width - text_width) // 2, (height - text_height) // 2 + 100)
-    draw.text(position, text, font=font, fill=(255, 255, 255))
-    return img
+    This thread runs independently and attempts to reconnect when the stream is disconnected.
+    The main loop continues to update clock and sensors while reconnection attempts happen.
+    
+    Args:
+        rtsp_url: RTSP stream URL
+        rtsp_timeout: Connection timeout in seconds
+        rtsp_cap_lock: Threading lock for accessing rtsp_cap_ref
+        rtsp_cap_ref: Reference to the RTSP VideoCapture object (list with single element)
+        rtsp_reconnect_info: Thread-safe reference to reconnection info dict (list with single dict)
+    """
+    global shutdown_flag
+    reconnect_interval = 5  # Wait 5 seconds between reconnection attempts
+    log.info("RTSP reconnection thread started")
+    
+    while not shutdown_flag:
+        try:
+            # Check if we need to reconnect
+            with rtsp_cap_lock:
+                current_cap = rtsp_cap_ref[0]
+            
+            if current_cap is None or not current_cap.isOpened():
+                # Update reconnection info
+                with rtsp_cap_lock:
+                    info = rtsp_reconnect_info[0]
+                    info['attempt_count'] = info.get('attempt_count', 0) + 1
+                    info['last_attempt_time'] = time.time()
+                    info['status'] = 'attempting'
+                
+                # Attempt to reconnect
+                log.info(f"Attempting to reconnect to RTSP stream (attempt {info['attempt_count']})...")
+                new_cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
+                
+                if new_cap is not None and new_cap.isOpened():
+                    # Successfully reconnected
+                    with rtsp_cap_lock:
+                        # Release old cap if it exists
+                        if rtsp_cap_ref[0] is not None:
+                            try:
+                                rtsp_cap_ref[0].release()
+                            except:
+                                pass
+                        rtsp_cap_ref[0] = new_cap
+                        # Reset reconnection info on success
+                        rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+                    log.info("RTSP stream reconnected successfully")
+                else:
+                    # Reconnection failed, will try again after interval
+                    with rtsp_cap_lock:
+                        rtsp_reconnect_info[0]['status'] = 'failed'
+                    log.debug(f"RTSP reconnection failed, will retry in {reconnect_interval} seconds")
+            else:
+                # Stream is connected, update status
+                with rtsp_cap_lock:
+                    rtsp_reconnect_info[0]['status'] = 'connected'
+                pass
+            
+            # Wait before next check
+            time.sleep(reconnect_interval)
+            
+        except Exception as e:
+            log.error(f"Error in RTSP reconnection thread: {e}")
+            time.sleep(reconnect_interval)
+    
+    log.info("RTSP reconnection thread stopped")
 
 ####################################################################################################
 # Main execution
@@ -928,7 +1071,7 @@ try:
     from ultralytics import YOLO
     # YOLOv11 will auto-download on first use if not present
     # Using YOLOv11n (nano) for RPi - lowest CPU usage while maintaining good accuracy
-    yolo_model = YOLO('yolo11n.pt')  # Will download if not found
+    yolo_model = YOLO('yolo11s.pt')  # Will download if not found
     yolo_version = "YOLOv11"
     log.info("YOLOv11 model loaded successfully")
 except ImportError:
@@ -944,7 +1087,12 @@ except Exception as e:
 use_local_file = get_config_bool(config, 'VIDEO', 'use_local_file', fallback=False)
 local_file_path = config.get('VIDEO', 'local_file_path', fallback='').strip()
 
+# Initialize video capture
 cap = None
+rtsp_cap_ref = [None]  # Thread-safe reference to RTSP cap (list with single element)
+rtsp_cap_lock = None
+rtsp_reconnection_thread_obj = None
+rtsp_reconnect_info = [{'attempt_count': 0, 'last_attempt_time': None, 'status': 'disconnected'}]  # Thread-safe reconnection info
 rtsp_url = None
 rtsp_timeout = 10
 
@@ -963,7 +1111,45 @@ else:
     else:
         log.info("RTSP stream configured")
         rtsp_timeout = config.getint('RTSP', 'timeout', fallback=10)
-        cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
+        
+        # Create lock for thread-safe access to RTSP cap
+        # Check if threading is available
+        try:
+            import threading
+            has_threading = True
+        except ImportError:
+            has_threading = False
+        
+        if has_threading:
+            rtsp_cap_lock = threading.Lock()
+        else:
+            # Fallback: create a simple lock-like object (no-op if threading not available)
+            class DummyLock:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+            rtsp_cap_lock = DummyLock()
+        
+        # Attempt initial connection (non-blocking - if it fails, background thread will retry)
+        initial_cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
+        if initial_cap is not None:
+            rtsp_cap_ref[0] = initial_cap
+            cap = initial_cap
+            rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+            log.info("RTSP stream connected on startup")
+        else:
+            rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'disconnected'}
+            log.warning("RTSP stream connection failed on startup. Background reconnection thread will continue attempts.")
+        
+        # Start background reconnection thread (if threading is available)
+        if has_threading:
+            rtsp_reconnection_thread_obj = threading.Thread(
+                target=rtsp_reconnection_thread,
+                args=(rtsp_url, rtsp_timeout, rtsp_cap_lock, rtsp_cap_ref, rtsp_reconnect_info),
+                daemon=True
+            )
+            rtsp_reconnection_thread_obj.start()
+        else:
+            log.warning("Threading not available - RTSP reconnection will happen in main loop (may block)")
 
 # Get ROI configuration
 roi_method = config.get('ROI', 'roi_method', fallback='point_quadrant').strip().lower()
@@ -1568,45 +1754,54 @@ try:
                         time.sleep(0.5)
                         continue
         elif rtsp_url is not None:
-            # RTSP stream mode
-            if cap is None:  # If the stream is not connected, try to reconnect
-                log.debug("Attempting to reconnect to RTSP stream...")
-                cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
-                time.sleep(1)
-                continue
-
-            # Suppress FFmpeg stderr during frame reading to avoid H.264 decoding error spam
-            # These errors are non-fatal and occur with packet loss/corruption
-            try:
-                with suppress_stderr():
-                    ret, frame = cap.read()
-            except Exception as e:
-                log.error(f"Error reading frame (decoding error?): {e}")
-                ret = False
-                frame = None
+            # RTSP stream mode - use thread-safe shared cap
+            # Get current cap from shared reference (background thread may have reconnected)
+            if rtsp_cap_lock is not None:
+                with rtsp_cap_lock:
+                    cap = rtsp_cap_ref[0]
+            else:
+                cap = rtsp_cap_ref[0]
             
-            # If frame is not grabbed, try a few more times before reconnecting
-            if not ret:
-                # Try reading a few more frames in case of temporary glitch
-                retry_count = 0
-                while retry_count < 3 and not ret:
-                    time.sleep(0.1)
-                    try:
-                        with suppress_stderr():
-                            ret, frame = cap.read()
-                    except Exception as e:
-                        log.debug(f"Retry read failed: {e}")
-                        ret = False
-                        frame = None
-                    retry_count += 1
+            # If the stream is not connected, show placeholder and continue (reconnection happens in background)
+            if cap is None or not cap.isOpened():
+                frame = None
+                ret = False
+                # Continue to display update (will show placeholder)
+            else:
+                # Suppress FFmpeg stderr during frame reading to avoid H.264 decoding error spam
+                # These errors are non-fatal and occur with packet loss/corruption
+                try:
+                    with suppress_stderr():
+                        ret, frame = cap.read()
+                except Exception as e:
+                    log.error(f"Error reading frame (decoding error?): {e}")
+                    ret = False
+                    frame = None
                 
+                # If frame is not grabbed, mark as failed (background thread will handle reconnection)
                 if not ret:
-                    log.warning("Failed to grab frame after retries. Reconnecting to the stream...")
+                    log.debug("Failed to read frame from RTSP stream (background thread will handle reconnection)")
+                    frame = None
+                    ret = False
+                    # Check if cap is still valid, if not, clear it
                     if cap is not None:
-                        cap.release()
-                    cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
-                    time.sleep(5)
-                    continue
+                        try:
+                            if not cap.isOpened():
+                                # Cap is closed, clear reference so background thread knows to reconnect
+                                if rtsp_cap_lock is not None:
+                                    with rtsp_cap_lock:
+                                        rtsp_cap_ref[0] = None
+                                else:
+                                    rtsp_cap_ref[0] = None
+                                cap = None
+                        except:
+                            # Cap may be in invalid state, clear it
+                            if rtsp_cap_lock is not None:
+                                with rtsp_cap_lock:
+                                    rtsp_cap_ref[0] = None
+                            else:
+                                rtsp_cap_ref[0] = None
+                            cap = None
         else:
             # No video source - create placeholder
             frame = None
@@ -1707,7 +1902,11 @@ try:
             if use_full_frame:
                 display_image = create_placeholder_image(640, 480, config=config)
             else:
-                display_image = create_placeholder_image(roi_w, roi_h, config=config)
+                # If ROI dimensions are not available yet (point_quadrant method before first frame),
+                # use default dimensions that match typical ROI sizes
+                placeholder_w = roi_w if roi_w is not None else 550
+                placeholder_h = roi_h if roi_h is not None else 580
+                display_image = create_placeholder_image(placeholder_w, placeholder_h, config=config)
         
         # Overlay bounding boxes from latest CV results if available
         if display_lock:
@@ -1733,13 +1932,22 @@ try:
                     display_image, current_detections, display_w, display_h, config=config, class_names=class_names
                 )
         
-        # Display the image with statusbar (thread-safe read of car_history)
+        # Display the image with statusbar (thread-safe read of car_history and reconnection info)
         if display_lock:
             with display_lock:
                 current_car_history = car_history.copy()  # Copy for thread safety
         else:
             current_car_history = car_history
-        draw_statusbar(current_car_history, display_image, config, display, sensor)
+        
+        # Get reconnection info (thread-safe read for RTSP)
+        current_reconnect_info = None
+        if rtsp_url is not None and rtsp_cap_lock is not None:
+            with rtsp_cap_lock:
+                current_reconnect_info = rtsp_reconnect_info
+        elif rtsp_url is not None:
+            current_reconnect_info = rtsp_reconnect_info
+        
+        draw_statusbar(current_car_history, display_image, config, display, sensor, current_reconnect_info)
 
         # Small sleep to prevent tight loop (reduced to ~15fps for better RPi performance)
         # 15fps is sufficient for status display and reduces CPU load significantly
@@ -1752,7 +1960,26 @@ except Exception as e:
 finally:
     # Cleanup
     log.info("Cleaning up resources...")
+    # Release RTSP cap from shared reference if it exists
+    if rtsp_cap_ref is not None and rtsp_cap_lock is not None:
+        with rtsp_cap_lock:
+            if rtsp_cap_ref[0] is not None:
+                try:
+                    rtsp_cap_ref[0].release()
+                except:
+                    pass
+                rtsp_cap_ref[0] = None
+    elif rtsp_cap_ref is not None and rtsp_cap_ref[0] is not None:
+        try:
+            rtsp_cap_ref[0].release()
+        except:
+            pass
+        rtsp_cap_ref[0] = None
+    # Also release local cap if it exists (for local file mode)
     if cap is not None:
-        cap.release()
+        try:
+            cap.release()
+        except:
+            pass
     display_exit(display)
     log.info("Shutdown complete")
