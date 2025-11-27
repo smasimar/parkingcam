@@ -16,6 +16,13 @@ from contextlib import contextmanager
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 
+# Load environment variables from .env file (if present)
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
 # RPi DHT sensor and SPI display related imports
 import board
 import adafruit_dht
@@ -125,10 +132,12 @@ def get_default_config():
                            'car_present_threshold': '80', 'car_absent_threshold': '40', 
                            'show_statusbar': 'true', 'cv_interval': '1.0',
                            'temporal_smoothing_cycles': '1',
-                           'moondream_rate_limit_seconds': '60',
+                           'moondream_interval': '60',
                            'moondream_time_window_enabled': 'true',
                            'moondream_time_window_start': '10:00',
-                           'moondream_time_window_end': '22:00'}
+                           'moondream_time_window_end': '22:00',
+                           'moondream_max_width': '0',
+                           'moondream_max_height': '0'}
     config['CLOCK'] = {'enabled': 'false'}
     config['DISPLAY'] = {'font_path': 'assets/RobotoMonoMedium.ttf'}
     return config
@@ -1030,14 +1039,27 @@ parser.add_argument('--interval', '-t', type=float, default=0.0, metavar='SECOND
                     help='Time interval in seconds between frame captures when using --save-frame (default: 0)')
 parser.add_argument('--output', '-o', type=str, default='.',
                     help='Output path for --save-frame (directory path, relative or absolute; default: current working directory). Filename is always snapshot_<timestamp>.png')
+parser.add_argument('--debug', '-d', action='store_true',
+                    help='Enable debug logging (verbose output)')
 args = parser.parse_args()
 
-# Setup logging (default to INFO level)
+# Setup logging (DEBUG level if --debug is used, otherwise INFO)
+log_level = logging.DEBUG if args.debug else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(levelname)s: %(message)s'
 )
 log = logging.getLogger(__name__)
+
+# Load environment variables from .env file (if available and file exists)
+if DOTENV_AVAILABLE:
+    env_loaded = load_dotenv()  # Load .env file from current directory
+    if env_loaded:
+        log.debug("Loaded environment variables from .env file")
+    # Note: load_dotenv() returns True if file was found and loaded, False otherwise
+    # We don't warn if .env doesn't exist - it's optional
+else:
+    log.debug("python-dotenv not available - using system environment variables only")
 
 # Load configuration
 config = load_config('parkingcam.conf', log)
@@ -1180,7 +1202,7 @@ def detect_with_moondream_api(frame, api_key, confidence_threshold, config=None,
     
     # Check rate limiting if config is provided
     if config is not None:
-        rate_limit_seconds = config.getint('DETECTION', 'moondream_rate_limit_seconds', fallback=60)
+        rate_limit_seconds = config.getfloat('DETECTION', 'moondream_interval', fallback=60.0)
         current_time = time.time()
         
         # Check if enough time has passed since last API call
@@ -1228,12 +1250,49 @@ def detect_with_moondream_api(frame, api_key, confidence_threshold, config=None,
                     logger.warning(f"Error checking Moondream time window: {e}. Allowing API call.")
     
     try:
-        # Get frame dimensions for coordinate conversion
-        frame_height, frame_width = frame.shape[:2]
+        # Get original frame dimensions for coordinate conversion (before any resizing)
+        original_frame_height, original_frame_width = frame.shape[:2]
         
         # Convert OpenCV frame (BGR) to PIL Image (RGB)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(frame_rgb)
+        
+        # Resize image if max dimensions are configured
+        resize_ratio = 1.0
+        if config is not None:
+            max_width = config.getint('DETECTION', 'moondream_max_width', fallback=0)
+            max_height = config.getint('DETECTION', 'moondream_max_height', fallback=0)
+            
+            if max_width > 0 or max_height > 0:
+                # Calculate resize dimensions maintaining aspect ratio
+                img_width, img_height = pil_image.size
+                original_size = (img_width, img_height)
+                
+                # If only one dimension is set, maintain aspect ratio
+                if max_width > 0 and max_height > 0:
+                    # Both dimensions specified - resize to fit within bounds
+                    ratio_w = max_width / img_width if img_width > max_width else 1.0
+                    ratio_h = max_height / img_height if img_height > max_height else 1.0
+                    ratio = min(ratio_w, ratio_h)
+                elif max_width > 0:
+                    # Only width specified
+                    ratio = max_width / img_width if img_width > max_width else 1.0
+                else:
+                    # Only height specified
+                    ratio = max_height / img_height if img_height > max_height else 1.0
+                
+                if ratio < 1.0:
+                    # Resize the image
+                    new_width = int(img_width * ratio)
+                    new_height = int(img_height * ratio)
+                    pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    resize_ratio = ratio
+                    
+                    if logger:
+                        logger.debug(f"Resized image for Moondream: {original_size} -> {pil_image.size} (ratio: {ratio:.2f})")
+        
+        if logger:
+            logger.debug(f"Sending image to Moondream API: {pil_image.size[0]}x{pil_image.size[1]} pixels")
         
         # Convert PIL image to base64-encoded JPEG data URL format
         buffer = BytesIO()
@@ -1273,6 +1332,10 @@ def detect_with_moondream_api(frame, api_key, confidence_threshold, config=None,
         
         detect_result = detect_response.json()
         
+        # Debug: log full response (will show when --debug is used)
+        if logger:
+            logger.debug(f"Moondream API response: {json.dumps(detect_result, indent=2)}")
+        
         # Parse detection results
         detections = []
         objects = detect_result.get('objects', [])
@@ -1286,17 +1349,20 @@ def detect_with_moondream_api(frame, api_key, confidence_threshold, config=None,
         car_class_id = 2
         
         for obj in objects:
-            # Moondream returns normalized coordinates (0-1)
+            # Moondream returns normalized coordinates (0-1) relative to the image sent
+            # Since normalized coordinates are scale-independent (percentages), we can
+            # convert them directly to the original frame pixel coordinates
             x_min_norm = float(obj.get('x_min', 0))
             y_min_norm = float(obj.get('y_min', 0))
             x_max_norm = float(obj.get('x_max', 0))
             y_max_norm = float(obj.get('y_max', 0))
             
-            # Convert normalized coordinates to pixel coordinates
-            x1 = int(x_min_norm * frame_width)
-            y1 = int(y_min_norm * frame_height)
-            x2 = int(x_max_norm * frame_width)
-            y2 = int(y_max_norm * frame_height)
+            # Convert normalized coordinates to pixel coordinates in original frame
+            # (normalized coords work regardless of resized image size)
+            x1 = int(x_min_norm * original_frame_width)
+            y1 = int(y_min_norm * original_frame_height)
+            x2 = int(x_max_norm * original_frame_width)
+            y2 = int(y_max_norm * original_frame_height)
             
             # Validate bounding box
             if x2 <= x1 or y2 <= y1:
@@ -1732,20 +1798,59 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                 results = yolo_model(detection_frame, conf=confidence_threshold, verbose=False)
                 detections = results
                 
+                # Collect all detections for debug logging
+                all_detections = []
+                
                 # Check for classes that trigger parking spot occupancy (early exit for performance)
                 for result in results:
                     boxes = result.boxes
                     if len(boxes) > 0:
+                        # Get class names from result object if available
+                        result_class_names = None
+                        if hasattr(result, 'names') and result.names:
+                            result_class_names = result.names
+                        
                         # Convert to numpy once for better performance
                         if hasattr(boxes.cls, 'cpu'):
                             class_ids = boxes.cls.cpu().numpy()
+                            confidences = boxes.conf.cpu().numpy()
                         else:
                             class_ids = boxes.cls.numpy()
+                            confidences = boxes.conf.numpy()
+                        
+                        # Collect detections for debug logging
+                        for i in range(len(boxes)):
+                            class_id = int(class_ids[i])
+                            confidence = float(confidences[i])
+                            
+                            # Get class name
+                            if result_class_names and class_id in result_class_names:
+                                class_name = result_class_names[class_id]
+                            elif result_class_names and isinstance(result_class_names, (list, tuple)) and class_id < len(result_class_names):
+                                class_name = result_class_names[class_id]
+                            else:
+                                class_name = f"Class_{class_id}"
+                            
+                            all_detections.append({
+                                'class_id': class_id,
+                                'class_name': class_name,
+                                'confidence': confidence
+                            })
                         
                         # Check if any detected class is in trigger classes (vectorized check)
                         if any(int(cid) in CAR_STATUS_TRIGGER_CLASSES for cid in class_ids):
                             car_detected = True
                             break
+                
+                # Debug: log all YOLO detections (will show when --debug is used)
+                if all_detections:
+                    detection_summary = ", ".join([
+                        f"{det['class_name']} ({det['class_id']}): {det['confidence']:.2f}"
+                        for det in all_detections
+                    ])
+                    log.debug(f"YOLO detections: {detection_summary}")
+                else:
+                    log.debug("YOLO detections: none")
         
         # HYBRID APPROACH #2: Temporal smoothing - if detection failed but car was detected recently, keep it
         if not car_detected and last_car_detection_time is not None:
