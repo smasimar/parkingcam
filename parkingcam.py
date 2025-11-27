@@ -385,9 +385,9 @@ def build_display_canvas(car_image, car_history, config, sensor=None, display_wi
             # Position below clock
             y_offset = video_start_y
 
-            # Paste the processed image (full screen)
-            canvas.paste(car_image, (x_offset, y_offset))
-        
+        # Paste the processed image (full screen)
+        canvas.paste(car_image, (x_offset, y_offset))
+
         draw = ImageDraw.Draw(canvas)
         # Draw status bar if enabled
         if get_config_bool(config, 'DETECTION', 'show_statusbar', fallback=True):
@@ -716,19 +716,30 @@ def signal_handler(signum, frame):
     shutdown_flag = True
 
 
-def draw_statusbar(car_history, debug_image, config, display, sensor, rtsp_reconnect_info=None):
-    """Draw status bar on display and log status to console
+def draw_statusbar(car_history, debug_image, config, display, sensor, rtsp_reconnect_info=None, log_status=False):
+    """Draw status bar on display and optionally log status to console
     
     The status bar shows green/red indicators for each frame in the car detection history,
     with green indicating car/suitcase detected and red indicating empty spot.
+    
+    Args:
+        car_history: List of car detection history
+        debug_image: Image to display
+        config: Configuration object
+        display: Display object
+        sensor: Sensor object
+        rtsp_reconnect_info: Reconnection info
+        log_status: If True, log the status bar to console (default: False)
     """
     if display is not None:
         display_draw_status(display, car_history, debug_image, config, sensor, rtsp_reconnect_info)
 
-    statusbar = ''
-    for i, car_present in enumerate(car_history):
-        statusbar = f'{statusbar}✔️ ' if car_present else f'{statusbar}❌ '
-    log.debug(statusbar)
+    # Only log status bar when explicitly requested (e.g., when detection updates occur)
+    if log_status:
+        statusbar = ''
+        for i, car_present in enumerate(car_history):
+            statusbar = f'{statusbar}✔️ ' if car_present else f'{statusbar}❌ '
+        log.debug(statusbar)
 
 def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=None, class_names=None):
     """Overlay bounding boxes on an existing PIL image (YOLO detections)
@@ -843,8 +854,8 @@ def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=
                         for dx, dy in offsets:
                             draw.text((captionX + dx * outline_width, captionY + dy * outline_width), 
                                      label, font=font, fill=outlinecolor)
-                        # Draw the text over it
-                        draw.text((captionX, captionY), label, font=font, fill=class_color)
+                    # Draw the text over it
+                    draw.text((captionX, captionY), label, font=font, fill=class_color)
 
     return image_pil
 
@@ -1004,6 +1015,8 @@ def rtsp_reconnection_thread(rtsp_url, rtsp_timeout, rtsp_cap_lock, rtsp_cap_ref
                         rtsp_cap_ref[0] = new_cap
                         # Reset reconnection info on success
                         rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+                    # Reset ROI cache since video resolution may have changed
+                    reset_roi_cache()
                     log.info("RTSP stream reconnected successfully")
                 else:
                     # Reconnection failed, will try again after interval
@@ -1072,8 +1085,8 @@ signal.signal(signal.SIGTERM, signal_handler)
 display = None
 if not args.save_frame:
     display = display_init()
-    if display is None:
-        log.warning("Display initialization failed. Continuing without display.")
+if display is None:
+    log.warning("Display initialization failed. Continuing without display.")
 else:
     log.info("Skipping display initialization in save-frame mode")
 
@@ -1435,6 +1448,24 @@ else:
     log.warning(f"Unknown detection engine '{detection_engine}', defaulting to 'yolo'")
     detection_engine = 'yolo'
 
+# ROI caching: store calculated ROI coordinates with frame dimensions
+# This avoids recalculating ROI on every frame - only recalculates when frame size changes
+# Define cache variables and reset function early so they're available when needed
+_cached_roi = None  # (roi_x, roi_y, roi_w, roi_h, cached_frame_w, cached_frame_h)
+_cached_roi_point_x = None
+_cached_roi_point_y = None
+_cached_roi_quadrant = None
+
+def reset_roi_cache():
+    """Reset ROI cache (call when stream reconnects or video resolution might change)"""
+    global _cached_roi, _cached_roi_point_x, _cached_roi_point_y, _cached_roi_quadrant
+    _cached_roi = None
+    _cached_roi_point_x = None
+    _cached_roi_point_y = None
+    _cached_roi_quadrant = None
+    if 'log' in globals():
+        log.debug("ROI cache reset")
+
 # Check if using local file or RTSP stream
 use_local_file = get_config_bool(config, 'VIDEO', 'use_local_file', fallback=False)
 local_file_path = config.get('VIDEO', 'local_file_path', fallback='').strip()
@@ -1487,6 +1518,8 @@ else:
             rtsp_cap_ref[0] = initial_cap
             cap = initial_cap
             rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+            # Reset ROI cache for initial connection
+            reset_roi_cache()
             log.info("RTSP stream connected on startup")
         else:
             rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'disconnected'}
@@ -1507,32 +1540,98 @@ else:
 roi_method = config.get('ROI', 'roi_method', fallback='point_quadrant').strip().lower()
 use_full_frame = get_config_bool(config, 'ROI', 'use_full_frame', fallback=False)
 
-# ROI configuration based on method
-if roi_method == 'coordinates':
-    # Use explicit coordinates (x, y, width, height)
-    roi_x = config.getint('ROI', 'x', fallback=800)
-    roi_y = config.getint('ROI', 'y', fallback=500)
-    roi_w = config.getint('ROI', 'width', fallback=550)
-    roi_h = config.getint('ROI', 'height', fallback=580)
-    roi_point_x = None
-    roi_point_y = None
-    roi_quadrant = None
-    log.info(f"ROI method: coordinates - x={roi_x}, y={roi_y}, width={roi_w}, height={roi_h}")
-else:
-    # Use point + quadrant (default or if method is 'point_quadrant')
-    roi_point_x = config.getint('ROI', 'point_x', fallback=450)
-    roi_point_y = config.getint('ROI', 'point_y', fallback=400)
-    roi_quadrant = config.getint('ROI', 'quadrant', fallback=4)
-    roi_x = None
-    roi_y = None
-    roi_w = None
-    roi_h = None
-    log.info(f"ROI method: point_quadrant - point=({roi_point_x},{roi_point_y}), quadrant={roi_quadrant}")
+# ROI configuration based on method (all values are percentages 0-100)
+# Initialize all variables to None first
+roi_x_percent = None
+roi_y_percent = None
+roi_w_percent = None
+roi_h_percent = None
+roi_point_x_percent = None
+roi_point_y_percent = None
+roi_quadrant = None
+roi_x = None
+roi_y = None
+roi_w = None
+roi_h = None
 
-# ROI will be calculated from point + quadrant when we have frame dimensions
-# Function to calculate ROI coordinates from point + quadrant
-def calculate_roi_from_point_quadrant(point_x, point_y, quadrant, frame_width, frame_height):
-    """Calculate ROI (x, y, width, height) from point and quadrant
+if roi_method == 'coordinates':
+    # Use explicit coordinates (x, y, width, height as percentages)
+    roi_x_percent = config.getfloat('ROI', 'x', fallback=50.0)
+    roi_y_percent = config.getfloat('ROI', 'y', fallback=40.0)
+    roi_w_percent = config.getfloat('ROI', 'width', fallback=30.0)
+    roi_h_percent = config.getfloat('ROI', 'height', fallback=35.0)
+    log.info(f"ROI method: coordinates (percentages) - x={roi_x_percent}%, y={roi_y_percent}%, width={roi_w_percent}%, height={roi_h_percent}%")
+else:
+    # Use point + quadrant (default or if method is 'point_quadrant') - point as percentages
+    roi_point_x_percent = config.getfloat('ROI', 'point_x', fallback=40.0)
+    roi_point_y_percent = config.getfloat('ROI', 'point_y', fallback=35.0)
+    roi_quadrant = config.getint('ROI', 'quadrant', fallback=4)
+    log.info(f"ROI method: point_quadrant (percentages) - point=({roi_point_x_percent}%,{roi_point_y_percent}%), quadrant={roi_quadrant}")
+
+def get_cached_roi_coordinates(frame_width, frame_height, roi_point_x_percent=None, roi_point_y_percent=None, roi_quadrant=None,
+                               roi_x_percent=None, roi_y_percent=None, roi_w_percent=None, roi_h_percent=None):
+    """Get ROI coordinates from cache or calculate if frame dimensions changed
+    
+    Args:
+        frame_width, frame_height: Current frame dimensions in pixels
+        roi_point_x_percent, roi_point_y_percent, roi_quadrant: For point_quadrant method (percentages 0-100)
+        roi_x_percent, roi_y_percent, roi_w_percent, roi_h_percent: For coordinates method (percentages 0-100)
+    
+    Returns:
+        Tuple of (roi_x, roi_y, roi_w, roi_h) in pixels, or None if no valid ROI config
+    """
+    global _cached_roi, _cached_roi_point_x, _cached_roi_point_y, _cached_roi_quadrant
+    
+    # Point + quadrant method
+    if roi_point_x_percent is not None and roi_point_y_percent is not None and roi_quadrant is not None:
+        # Check if cache is valid (same point/quadrant and same frame dimensions)
+        if (_cached_roi is not None and 
+            _cached_roi_point_x == roi_point_x_percent and
+            _cached_roi_point_y == roi_point_y_percent and
+            _cached_roi_quadrant == roi_quadrant and
+            _cached_roi[4] == frame_width and
+            _cached_roi[5] == frame_height):
+            # Cache hit - return cached coordinates
+            return _cached_roi[0], _cached_roi[1], _cached_roi[2], _cached_roi[3]
+        
+        # Cache miss or frame dimensions changed - calculate and cache
+        roi_x, roi_y, roi_w, roi_h = calculate_roi_from_point_quadrant(
+            roi_point_x_percent, roi_point_y_percent, roi_quadrant, frame_width, frame_height
+        )
+        _cached_roi = (roi_x, roi_y, roi_w, roi_h, frame_width, frame_height)
+        _cached_roi_point_x = roi_point_x_percent
+        _cached_roi_point_y = roi_point_y_percent
+        _cached_roi_quadrant = roi_quadrant
+        log.debug(f"Recalculated ROI from point ({roi_point_x_percent}%,{roi_point_y_percent}%) + quadrant {roi_quadrant}: ({roi_x},{roi_y},{roi_w},{roi_h}) for frame {frame_width}x{frame_height}")
+        return roi_x, roi_y, roi_w, roi_h
+    
+    # Coordinates method (always recalculate since no separate cache for this method)
+    if roi_x_percent is not None and roi_y_percent is not None and roi_w_percent is not None and roi_h_percent is not None:
+        roi_x, roi_y, roi_w, roi_h = calculate_roi_from_percentages(
+            roi_x_percent, roi_y_percent, roi_w_percent, roi_h_percent, frame_width, frame_height
+        )
+        log.debug(f"Calculated ROI from percentages: x={roi_x_percent}%, y={roi_y_percent}%, w={roi_w_percent}%, h={roi_h_percent}% -> ({roi_x},{roi_y},{roi_w},{roi_h}) for frame {frame_width}x{frame_height}")
+        return roi_x, roi_y, roi_w, roi_h
+    
+    # No valid ROI config
+    return None
+
+# Helper function to convert percentage to pixels
+def percent_to_pixels(percent, dimension):
+    """Convert percentage (0-100) to pixel value based on dimension
+    
+    Args:
+        percent: Percentage value (0-100)
+        dimension: Total dimension (width or height)
+    
+    Returns:
+        Pixel value (integer)
+    """
+    return int(percent * dimension / 100.0)
+
+# Function to calculate ROI coordinates from point + quadrant (percentages)
+def calculate_roi_from_point_quadrant(point_x_percent, point_y_percent, quadrant, frame_width, frame_height):
+    """Calculate ROI (x, y, width, height) from point percentages and quadrant
     
     Quadrants:
     1 = Top right: from point to top-right corner (point is bottom-left of ROI)
@@ -1541,13 +1640,17 @@ def calculate_roi_from_point_quadrant(point_x, point_y, quadrant, frame_width, f
     4 = Bottom right: from point to bottom-right corner (point is top-left of ROI)
     
     Args:
-        point_x, point_y: Point coordinates
+        point_x_percent, point_y_percent: Point coordinates as percentages (0-100)
         quadrant: Quadrant number (1-4)
-        frame_width, frame_height: Frame dimensions
+        frame_width, frame_height: Frame dimensions in pixels
     
     Returns:
-        Tuple of (x, y, width, height) for ROI
+        Tuple of (x, y, width, height) for ROI in pixels
     """
+    # Convert percentages to pixels
+    point_x = percent_to_pixels(point_x_percent, frame_width)
+    point_y = percent_to_pixels(point_y_percent, frame_height)
+    
     if quadrant == 1:  # Top right
         x = point_x
         y = 0
@@ -1583,6 +1686,32 @@ def calculate_roi_from_point_quadrant(point_x, point_y, quadrant, frame_width, f
     
     return x, y, width, height
 
+# Function to calculate ROI coordinates from percentage-based coordinates
+def calculate_roi_from_percentages(x_percent, y_percent, width_percent, height_percent, frame_width, frame_height):
+    """Calculate ROI (x, y, width, height) from percentage-based coordinates
+    
+    Args:
+        x_percent, y_percent: Top-left corner position as percentages (0-100)
+        width_percent, height_percent: Size as percentages (0-100)
+        frame_width, frame_height: Frame dimensions in pixels
+    
+    Returns:
+        Tuple of (x, y, width, height) for ROI in pixels
+    """
+    # Convert percentages to pixels
+    x = percent_to_pixels(x_percent, frame_width)
+    y = percent_to_pixels(y_percent, frame_height)
+    width = percent_to_pixels(width_percent, frame_width)
+    height = percent_to_pixels(height_percent, frame_height)
+    
+    # Ensure valid dimensions
+    x = max(0, min(x, frame_width - 1))
+    y = max(0, min(y, frame_height - 1))
+    width = max(1, min(width, frame_width - x))
+    height = max(1, min(height, frame_height - y))
+    
+    return x, y, width, height
+
 # ROI coordinates are now set above based on roi_method
 # If using point_quadrant, roi_x/roi_y/roi_w/roi_h will be None initially and calculated dynamically
 # If using coordinates, roi_x/roi_y/roi_w/roi_h are set directly from config
@@ -1609,6 +1738,7 @@ latest_detections = None  # YOLO detection results for bounding box overlay
 latest_detection_frame_size = None  # (width, height) tuple for coordinate scaling
 cv_processing = False  # Flag to prevent multiple concurrent CV processing threads
 display_lock = None
+car_history_updated = False  # Flag to track when car_history is updated (for status bar logging)
 
 # Frame caching for static scenes (detect identical frames)
 last_frame_hash = None
@@ -1620,6 +1750,7 @@ last_car_detection_time = None  # Timestamp of last successful car detection (in
 
 # Moondream API rate limiting and time window tracking
 last_moondream_api_call_time = None  # Timestamp of last Moondream API call
+last_moondream_result = None  # Cached last successful Moondream detection result (car_detected, detections, frame_size)
 try:
     import threading
     display_lock = threading.Lock()
@@ -1672,7 +1803,8 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                          config=None,
                          last_frame_hash=None, last_frame_detection_result=None,
                          last_car_detection_time=None, temporal_smoothing_window=3.0,
-                         roi_point_x=None, roi_point_y=None, roi_quadrant=None):
+                         roi_point_x_percent=None, roi_point_y_percent=None, roi_quadrant=None,
+                         roi_x_percent=None, roi_y_percent=None, roi_w_percent=None, roi_h_percent=None, roi_method='point_quadrant'):
     """Process a frame with object detection (YOLO or Moondream API)
     
     Detects objects in CAR_STATUS_TRIGGER_CLASSES (currently car, truck, boat, suitcase) in the frame or ROI.
@@ -1685,7 +1817,7 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
     Args:
         frame: OpenCV frame (numpy array)
         use_full_frame: If True, use entire frame; if False, extract ROI first
-        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (only used if use_full_frame=False)
+        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates in pixels (only used if use_full_frame=False and already calculated)
         detection_engine: Detection engine ('yolo' or 'moondream')
         yolo_model: YOLOv11 model instance (None if using Moondream)
         moondream_api_key: Moondream API key (None if using YOLO)
@@ -1694,6 +1826,9 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         last_frame_detection_result: Cached (car_detected, detections, frame_size) tuple
         last_car_detection_time: Timestamp of last successful car detection (for temporal smoothing)
         temporal_smoothing_window: Time window in seconds for temporal smoothing (calculated as cv_interval * cycles)
+        roi_point_x_percent, roi_point_y_percent, roi_quadrant: For point_quadrant method (percentages 0-100)
+        roi_x_percent, roi_y_percent, roi_w_percent, roi_h_percent: For coordinates method (percentages 0-100)
+        roi_method: ROI method ('point_quadrant' or 'coordinates')
     
     Returns:
         Tuple of (car_detected, detections, frame_size, frame_hash):
@@ -1713,12 +1848,19 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
             # Extract ROI from frame (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
             
-            # Calculate ROI from point + quadrant if not already calculated
-            if roi_x is None and roi_point_x is not None and roi_point_y is not None and roi_quadrant is not None:
-                roi_x, roi_y, roi_w, roi_h = calculate_roi_from_point_quadrant(
-                    roi_point_x, roi_point_y, roi_quadrant, frame_w, frame_h
-                )
-                log.debug(f"Calculated ROI from point ({roi_point_x},{roi_point_y}) + quadrant {roi_quadrant}: ({roi_x},{roi_y},{roi_w},{roi_h})")
+            # Get ROI coordinates from cache (or calculate if frame dimensions changed)
+            if roi_x is None:
+                if roi_method == 'coordinates':
+                    cached_roi = get_cached_roi_coordinates(frame_w, frame_h,
+                                                           roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent,
+                                                           roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent)
+                else:
+                    cached_roi = get_cached_roi_coordinates(frame_w, frame_h,
+                                                           roi_point_x_percent=roi_point_x_percent,
+                                                           roi_point_y_percent=roi_point_y_percent,
+                                                           roi_quadrant=roi_quadrant)
+                if cached_roi is not None:
+                    roi_x, roi_y, roi_w, roi_h = cached_roi
             
             # Store original ROI values for logging
             original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
@@ -1757,6 +1899,7 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         
         # Run detection based on selected engine
         use_yolo_fallback = False
+        global last_moondream_result
         
         if detection_engine == 'moondream':
             # Moondream API detection (config passed for rate limiting and time window)
@@ -1783,11 +1926,33 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                     detections = create_moondream_detection_wrapper(
                         moondream_detections, frame_w, frame_h
                     )
-            else:
-                # Moondream failed/not available (time window, rate limit, or API error) - fallback to YOLO
-                use_yolo_fallback = True
+                
+                # Cache successful Moondream result for use during rate limiting
+                last_moondream_result = (car_detected, detections, frame_size)
                 if log:
-                    log.debug("Moondream API unavailable, falling back to YOLO")
+                    log.debug(f"Moondream detection successful - cached result for rate limiting fallback")
+            else:
+                # Moondream returned None (rate limited, time window, or API error)
+                # Check if we have a cached result from a previous successful call
+                if last_moondream_result is not None:
+                    # Use cached Moondream result instead of falling back to YOLO
+                    cached_car_detected, cached_detections, cached_frame_size = last_moondream_result
+                    # Verify frame size still matches
+                    if cached_frame_size == frame_size:
+                        car_detected = cached_car_detected
+                        detections = cached_detections
+                        if log:
+                            log.debug("Moondream rate limited - using cached result instead of YOLO")
+                    else:
+                        # Frame size changed, can't use cached result - fallback to YOLO
+                        use_yolo_fallback = True
+                        if log:
+                            log.debug("Moondream unavailable and frame size changed - falling back to YOLO")
+                else:
+                    # No cached result available - fallback to YOLO
+                    use_yolo_fallback = True
+                    if log:
+                        log.debug("Moondream API unavailable and no cached result - falling back to YOLO")
         
         # Use YOLO if explicitly selected OR if Moondream fallback is needed
         if detection_engine != 'moondream' or use_yolo_fallback:
@@ -1841,7 +2006,7 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                         if any(int(cid) in CAR_STATUS_TRIGGER_CLASSES for cid in class_ids):
                             car_detected = True
                             break
-                
+        
                 # Debug: log all YOLO detections (will show when --debug is used)
                 if all_detections:
                     detection_summary = ", ".join([
@@ -1872,19 +2037,22 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         return False, None, (frame_w, frame_h), None
 
 def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=None,
-                          roi_point_x=None, roi_point_y=None, roi_quadrant=None):
+                          roi_point_x_percent=None, roi_point_y_percent=None, roi_quadrant=None,
+                          roi_x_percent=None, roi_y_percent=None, roi_w_percent=None, roi_h_percent=None, roi_method='point_quadrant'):
     """Prepare frame for display (without CV processing)
     
     Extracts ROI if needed and converts OpenCV BGR format to PIL RGB format.
     Performs bounds validation and clamping to ensure ROI fits within frame.
-    If roi_x is None, calculates ROI from point + quadrant based on frame dimensions.
+    If roi_x is None, calculates ROI from percentages based on frame dimensions.
     
     Args:
         frame: OpenCV frame (numpy array) or None
         use_full_frame: If True, use entire frame; if False, extract ROI
-        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (None if not yet calculated)
+        roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates in pixels (None if not yet calculated)
         config: Configuration object (optional)
-        roi_point_x, roi_point_y, roi_quadrant: ROI point and quadrant (used if roi_x is None)
+        roi_point_x_percent, roi_point_y_percent, roi_quadrant: For point_quadrant method (percentages 0-100)
+        roi_x_percent, roi_y_percent, roi_w_percent, roi_h_percent: For coordinates method (percentages 0-100)
+        roi_method: ROI method ('point_quadrant' or 'coordinates')
     
     Returns:
         PIL Image ready for display, or placeholder image if frame is None
@@ -1907,12 +2075,19 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
             # Extract ROI and convert to PIL Image (with bounds validation)
             frame_h, frame_w = frame.shape[:2]
             
-            # Calculate ROI from point + quadrant if not already calculated
-            if roi_x is None and roi_point_x is not None and roi_point_y is not None and roi_quadrant is not None:
-                roi_x, roi_y, roi_w, roi_h = calculate_roi_from_point_quadrant(
-                    roi_point_x, roi_point_y, roi_quadrant, frame_w, frame_h
-                )
-                log.debug(f"Calculated ROI from point ({roi_point_x},{roi_point_y}) + quadrant {roi_quadrant}: ({roi_x},{roi_y},{roi_w},{roi_h})")
+            # Get ROI coordinates from cache (or calculate if frame dimensions changed)
+            if roi_x is None:
+                if roi_method == 'coordinates':
+                    cached_roi = get_cached_roi_coordinates(frame_w, frame_h,
+                                                           roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent,
+                                                           roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent)
+                else:
+                    cached_roi = get_cached_roi_coordinates(frame_w, frame_h,
+                                                           roi_point_x_percent=roi_point_x_percent,
+                                                           roi_point_y_percent=roi_point_y_percent,
+                                                           roi_quadrant=roi_quadrant)
+                if cached_roi is not None:
+                    roi_x, roi_y, roi_w, roi_h = cached_roi
             
             # Store original ROI values for logging
             original_roi_x, original_roi_y, original_roi_w, original_roi_h = roi_x, roi_y, roi_w, roi_h
@@ -1940,7 +2115,8 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
 def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                         detection_engine, yolo_model, moondream_api_key, confidence_threshold,
                         car_history, history_size, car_present_threshold, car_absent_threshold,
-                        roi_point_x=None, roi_point_y=None, roi_quadrant=None):
+                        roi_point_x_percent=None, roi_point_y_percent=None, roi_quadrant=None,
+                        roi_x_percent=None, roi_y_percent=None, roi_w_percent=None, roi_h_percent=None, roi_method='point_quadrant'):
     """Background thread function for CV processing
     
     Runs object detection (YOLO or Moondream) on a frame and updates shared state:
@@ -1954,7 +2130,7 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
     """
     global latest_detections, latest_detection_frame_size, cv_processing
     global last_frame_hash, last_frame_detection_result, last_frame_hash_time
-    global last_car_detection_time, temporal_smoothing_window
+    global last_car_detection_time, temporal_smoothing_window, car_history_updated
     
     try:
         # Get current cache state (thread-safe read)
@@ -1976,7 +2152,9 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
             last_frame_detection_result=current_last_result,
             last_car_detection_time=current_last_detection_time,
             temporal_smoothing_window=temporal_smoothing_window,
-            roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
+            roi_point_x_percent=roi_point_x_percent, roi_point_y_percent=roi_point_y_percent, roi_quadrant=roi_quadrant,
+            roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent, roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent,
+            roi_method=roi_method
         )
         
         # Update frame cache and temporal smoothing state
@@ -2011,11 +2189,12 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
                 car_history.append(car_detected)
                 if len(car_history) > history_size:
                     car_history.pop(0)
-                
+                car_history_updated = True  # Flag that detection updated car_history
         else:
             car_history.append(car_detected)
             if len(car_history) > history_size:
                 car_history.pop(0)
+            car_history_updated = True  # Flag that detection updated car_history
     except Exception as e:
         log.error(f"Error in CV processing thread: {e}")
     finally:
@@ -2072,7 +2251,9 @@ if args.save_frame:
                 log.info(f"Frame {frame_num} captured successfully ({frame.shape[1]}x{frame.shape[0]})")
                 # Prepare base image (ROI extraction if needed)
                 display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config,
-                                                      roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant)
+                                                      roi_point_x_percent=roi_point_x_percent, roi_point_y_percent=roi_point_y_percent, roi_quadrant=roi_quadrant,
+            roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent, roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent,
+            roi_method=roi_method)
                 
                 # Run CV detection synchronously for bounding boxes
                 log.info("Running YOLO detection...")
@@ -2086,7 +2267,9 @@ if args.save_frame:
                         last_frame_detection_result=None,
                         last_car_detection_time=None,
                         temporal_smoothing_window=0.0,  # Disable temporal smoothing in save-frame mode
-                        roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
+                        roi_point_x_percent=roi_point_x_percent, roi_point_y_percent=roi_point_y_percent, roi_quadrant=roi_quadrant,
+            roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent, roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent,
+            roi_method=roi_method
                     )
                     log.info(f"Detection complete: car_detected={car_detected}")
                 except KeyboardInterrupt:
@@ -2258,7 +2441,8 @@ try:
                 args=(frame.copy(), use_full_frame, roi_x, roi_y, roi_w, roi_h,
                       detection_engine, yolo_model, moondream_api_key, confidence_threshold,
                       car_history, history_size, car_present_threshold, car_absent_threshold,
-                      roi_point_x, roi_point_y, roi_quadrant),
+                      roi_point_x_percent, roi_point_y_percent, roi_quadrant,
+                      roi_x_percent, roi_y_percent, roi_w_percent, roi_h_percent, roi_method),
                 daemon=True
             )
             thread.start()
@@ -2285,7 +2469,9 @@ try:
                 last_frame_detection_result=current_last_result,
                 last_car_detection_time=current_last_detection_time,
                 temporal_smoothing_window=temporal_smoothing_window,
-                roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant
+                roi_point_x_percent=roi_point_x_percent, roi_point_y_percent=roi_point_y_percent, roi_quadrant=roi_quadrant,
+            roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent, roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent,
+            roi_method=roi_method
             )
             
             # Update frame cache and temporal smoothing state
@@ -2312,10 +2498,12 @@ try:
                     car_history.append(car_detected)
                     if len(car_history) > history_size:
                         car_history.pop(0)
+                    car_history_updated = True  # Flag that detection updated car_history
             else:
                 car_history.append(car_detected)
                 if len(car_history) > history_size:
                     car_history.pop(0)
+                car_history_updated = True  # Flag that detection updated car_history
         elif cv_should_run:
             # No frame for CV - append False to history (thread-safe)
             last_cv_time = current_time
@@ -2324,15 +2512,19 @@ try:
                     car_history.append(False)
                     if len(car_history) > history_size:
                         car_history.pop(0)
+                    car_history_updated = True  # Flag that detection updated car_history
             else:
                 car_history.append(False)
                 if len(car_history) > history_size:
                     car_history.pop(0)
+                car_history_updated = True  # Flag that detection updated car_history
         
         # Always prepare and display the current frame (continuous video)
         if frame is not None and ret:
             display_image = prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, config=config,
-                                                  roi_point_x=roi_point_x, roi_point_y=roi_point_y, roi_quadrant=roi_quadrant)
+                                                  roi_point_x_percent=roi_point_x_percent, roi_point_y_percent=roi_point_y_percent, roi_quadrant=roi_quadrant,
+            roi_x_percent=roi_x_percent, roi_y_percent=roi_y_percent, roi_w_percent=roi_w_percent, roi_h_percent=roi_h_percent,
+            roi_method=roi_method)
         else:
             # No frame available - use placeholder
             if use_full_frame:
@@ -2369,11 +2561,21 @@ try:
                 )
         
         # Display the image with statusbar (thread-safe read of car_history and reconnection info)
+        should_log_status = False
+        
         if display_lock:
             with display_lock:
                 current_car_history = car_history.copy()  # Copy for thread safety
+                # Check if car_history was updated (detection ran)
+                if car_history_updated:
+                    should_log_status = True
+                    car_history_updated = False  # Reset flag after reading
         else:
             current_car_history = car_history
+            # Check if car_history was updated (detection ran)
+            if car_history_updated:
+                should_log_status = True
+                car_history_updated = False  # Reset flag after reading
         
         # Get reconnection info (thread-safe read for RTSP)
         current_reconnect_info = None
@@ -2383,7 +2585,7 @@ try:
         elif rtsp_url is not None:
             current_reconnect_info = rtsp_reconnect_info
         
-        draw_statusbar(current_car_history, display_image, config, display, sensor, current_reconnect_info)
+        draw_statusbar(current_car_history, display_image, config, display, sensor, current_reconnect_info, log_status=should_log_status)
 
         # Small sleep to prevent tight loop (reduced to ~15fps for better RPi performance)
         # 15fps is sufficient for status display and reduces CPU load significantly
