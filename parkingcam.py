@@ -8,9 +8,20 @@ import signal
 import configparser
 import argparse
 import hashlib
+import json
+import base64
+import requests
 from datetime import datetime
 from contextlib import contextmanager
+from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
+
+# Load environment variables from .env file (if present)
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
 
 # RPi DHT sensor and SPI display related imports
 import board
@@ -117,10 +128,16 @@ def get_default_config():
                      'x': '800', 'y': '500', 'width': '550', 'height': '580', 'use_full_frame': 'false'}
     config['TEMPERATURE'] = {'enabled': 'false', 'min_value': '16', 'ideal_value': '22', 'max_value': '28'}
     config['HUMIDITY'] = {'enabled': 'false', 'min_value': '25', 'ideal_value': '50', 'max_value': '75'}
-    config['DETECTION'] = {'confidence_threshold': '0.4', 'history_size': '120', 
+    config['DETECTION'] = {'engine': 'yolo', 'confidence_threshold': '0.4', 'history_size': '120', 
                            'car_present_threshold': '80', 'car_absent_threshold': '40', 
                            'show_statusbar': 'true', 'cv_interval': '1.0',
-                           'temporal_smoothing_cycles': '1'}
+                           'temporal_smoothing_cycles': '1',
+                           'moondream_interval': '60',
+                           'moondream_time_window_enabled': 'true',
+                           'moondream_time_window_start': '10:00',
+                           'moondream_time_window_end': '22:00',
+                           'moondream_max_width': '0',
+                           'moondream_max_height': '0'}
     config['CLOCK'] = {'enabled': 'false'}
     config['DISPLAY'] = {'font_path': 'assets/RobotoMonoMedium.ttf'}
     return config
@@ -773,7 +790,14 @@ def overlay_bounding_boxes(image_pil, detections, roi_width, roi_height, config=
                     class_id = int(boxes.cls[i].item() if hasattr(boxes.cls[i], 'item') else boxes.cls[i])
                     
                     # Get bounding box coordinates
-                    xyxy = boxes.xyxy[i].cpu().numpy() if hasattr(boxes.xyxy[i], 'cpu') else boxes.xyxy[i].numpy()
+                    # Handle both YOLO tensors (with .cpu()) and numpy arrays (Moondream wrapper)
+                    if hasattr(boxes.xyxy[i], 'cpu'):
+                        xyxy = boxes.xyxy[i].cpu().numpy()
+                    elif hasattr(boxes.xyxy[i], 'numpy'):
+                        xyxy = boxes.xyxy[i].numpy()
+                    else:
+                        # Already a numpy array or list
+                        xyxy = boxes.xyxy[i]
                     x1, y1, x2, y2 = xyxy
                     startX, startY, endX, endY = int(x1), int(y1), int(x2), int(y2)
                     
@@ -1015,14 +1039,27 @@ parser.add_argument('--interval', '-t', type=float, default=0.0, metavar='SECOND
                     help='Time interval in seconds between frame captures when using --save-frame (default: 0)')
 parser.add_argument('--output', '-o', type=str, default='.',
                     help='Output path for --save-frame (directory path, relative or absolute; default: current working directory). Filename is always snapshot_<timestamp>.png')
+parser.add_argument('--debug', '-d', action='store_true',
+                    help='Enable debug logging (verbose output)')
 args = parser.parse_args()
 
-# Setup logging (default to INFO level)
+# Setup logging (DEBUG level if --debug is used, otherwise INFO)
+log_level = logging.DEBUG if args.debug else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(levelname)s: %(message)s'
 )
 log = logging.getLogger(__name__)
+
+# Load environment variables from .env file (if available and file exists)
+if DOTENV_AVAILABLE:
+    env_loaded = load_dotenv()  # Load .env file from current directory
+    if env_loaded:
+        log.debug("Loaded environment variables from .env file")
+    # Note: load_dotenv() returns True if file was found and loaded, False otherwise
+    # We don't warn if .env doesn't exist - it's optional
+else:
+    log.debug("python-dotenv not available - using system environment variables only")
 
 # Load configuration
 config = load_config('parkingcam.conf', log)
@@ -1062,18 +1099,316 @@ last_humi_text = None
 last_humi_color = None
 humi_is_stale = False
 
-# Load YOLOv11 model
+####################################################################################################
+# Detection Engine Configuration
+####################################################################################################
+
+# COCO class name mapping for Moondream (common object names)
+COCO_CLASS_NAMES = {
+    0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus',
+    6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant',
+    11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat',
+    16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant',
+    21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella',
+    26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis'
+    # Add more as needed - these are the most common COCO classes
+}
+
+# Reverse mapping: class name to COCO ID
+COCO_NAME_TO_ID = {v: k for k, v in COCO_CLASS_NAMES.items()}
+
+def get_moondream_api_key():
+    """Get Moondream API key from environment variable
+    
+    Returns:
+        API key string or None if not set
+    """
+    api_key = os.environ.get('MOONDREAM_API_KEY')
+    if not api_key or not api_key.strip():
+        return None
+    return api_key.strip()
+
+def create_moondream_detection_wrapper(moondream_results, frame_width, frame_height):
+    """Create a YOLO-compatible wrapper for Moondream API detection results
+    
+    This creates a fake YOLO result object that can be used with existing overlay_bounding_boxes
+    and detection processing code.
+    
+    Args:
+        moondream_results: List of detection dictionaries from Moondream API
+        frame_width: Width of the detection frame
+        frame_height: Height of the detection frame
+    
+    Returns:
+        A list with one wrapper object that mimics YOLO results structure
+    """
+    import numpy as np
+    
+    class MoondreamBoxes:
+        """Fake boxes object that mimics YOLO's boxes structure"""
+        def __init__(self, detections):
+            self.detections = detections if detections else []
+            # Create numpy arrays for compatibility with YOLO interface
+            # YOLO uses: boxes.conf[i], boxes.cls[i], boxes.xyxy[i]
+            self.conf = np.array([d['confidence'] for d in self.detections], dtype=np.float32)
+            self.cls = np.array([d['class_id'] for d in self.detections], dtype=np.int64)
+            # Convert bbox [x1, y1, x2, y2] to numpy array format
+            self.xyxy = np.array([d['bbox'] for d in self.detections], dtype=np.float32)
+        
+        def __len__(self):
+            return len(self.detections)
+    
+    class MoondreamResult:
+        """Fake result object that mimics YOLO's result structure"""
+        def __init__(self, detections, frame_width, frame_height):
+            self.boxes = MoondreamBoxes(detections)
+            # Map COCO class names for compatibility (dictionary mapping class_id -> name)
+            self.names = COCO_CLASS_NAMES.copy()
+    
+    return [MoondreamResult(moondream_results, frame_width, frame_height)]
+
+def detect_with_moondream_api(frame, api_key, confidence_threshold, config=None, logger=None):
+    """Detect "car" objects using Moondream API (single detect call, no query step)
+    
+    Simplified to only detect cars directly to minimize API calls and token usage.
+    Includes rate limiting (max once per configured interval) and time window restrictions.
+    
+    Args:
+        frame: OpenCV frame (numpy array) - will be converted to PIL Image
+        api_key: Moondream API key
+        confidence_threshold: Minimum confidence threshold (0.0-1.0) - not used by Moondream API
+        config: Configuration object (optional, for rate limiting and time window)
+        logger: Logger instance (optional)
+    
+    Returns:
+        List of detection dictionaries with format:
+        [
+            {
+                'bbox': [x1, y1, x2, y2],  # Bounding box coordinates in pixels
+                'class_id': int,            # COCO class ID (2 for car)
+                'confidence': float,        # Confidence score (default 1.0 for Moondream)
+                'class_name': str           # Class name ("car")
+            },
+            ...
+        ]
+        Returns None on error or if rate limited/time window restricted
+    """
+    global last_moondream_api_call_time
+    
+    if not api_key:
+        if logger:
+            logger.error("Moondream API key not provided")
+        return None
+    
+    # Check rate limiting if config is provided
+    if config is not None:
+        rate_limit_seconds = config.getfloat('DETECTION', 'moondream_interval', fallback=60.0)
+        current_time = time.time()
+        
+        # Check if enough time has passed since last API call
+        if last_moondream_api_call_time is not None:
+            time_since_last_call = current_time - last_moondream_api_call_time
+            if time_since_last_call < rate_limit_seconds:
+                if logger:
+                    logger.debug(f"Moondream API rate limited: {rate_limit_seconds - int(time_since_last_call)}s remaining")
+                return None  # Rate limited - return None to skip detection
+        
+        # Check time window restriction
+        time_window_enabled = get_config_bool(config, 'DETECTION', 'moondream_time_window_enabled', fallback=True)
+        if time_window_enabled:
+            try:
+                window_start_str = config.get('DETECTION', 'moondream_time_window_start', fallback='10:00').strip()
+                window_end_str = config.get('DETECTION', 'moondream_time_window_end', fallback='22:00').strip()
+                
+                # Parse time window (HH:MM format)
+                start_hour, start_min = map(int, window_start_str.split(':'))
+                end_hour, end_min = map(int, window_end_str.split(':'))
+                
+                # Get current time
+                now = datetime.now()
+                current_hour = now.hour
+                current_min = now.minute
+                current_minutes = current_hour * 60 + current_min
+                start_minutes = start_hour * 60 + start_min
+                end_minutes = end_hour * 60 + end_min
+                
+                # Check if current time is within window
+                # Handle case where window spans midnight (e.g., 22:00 to 02:00)
+                if start_minutes > end_minutes:
+                    # Window spans midnight
+                    in_window = current_minutes >= start_minutes or current_minutes <= end_minutes
+                else:
+                    # Normal window within same day
+                    in_window = start_minutes <= current_minutes <= end_minutes
+                
+                if not in_window:
+                    if logger:
+                        logger.debug(f"Moondream API time window restricted: current time {now.strftime('%H:%M')} is outside {window_start_str}-{window_end_str}")
+                    return None  # Outside time window - return None to skip detection
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error checking Moondream time window: {e}. Allowing API call.")
+    
+    try:
+        # Get original frame dimensions for coordinate conversion (before any resizing)
+        original_frame_height, original_frame_width = frame.shape[:2]
+        
+        # Convert OpenCV frame (BGR) to PIL Image (RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        
+        # Resize image if max dimensions are configured
+        resize_ratio = 1.0
+        if config is not None:
+            max_width = config.getint('DETECTION', 'moondream_max_width', fallback=0)
+            max_height = config.getint('DETECTION', 'moondream_max_height', fallback=0)
+            
+            if max_width > 0 or max_height > 0:
+                # Calculate resize dimensions maintaining aspect ratio
+                img_width, img_height = pil_image.size
+                original_size = (img_width, img_height)
+                
+                # If only one dimension is set, maintain aspect ratio
+                if max_width > 0 and max_height > 0:
+                    # Both dimensions specified - resize to fit within bounds
+                    ratio_w = max_width / img_width if img_width > max_width else 1.0
+                    ratio_h = max_height / img_height if img_height > max_height else 1.0
+                    ratio = min(ratio_w, ratio_h)
+                elif max_width > 0:
+                    # Only width specified
+                    ratio = max_width / img_width if img_width > max_width else 1.0
+                else:
+                    # Only height specified
+                    ratio = max_height / img_height if img_height > max_height else 1.0
+                
+                if ratio < 1.0:
+                    # Resize the image
+                    new_width = int(img_width * ratio)
+                    new_height = int(img_height * ratio)
+                    pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    resize_ratio = ratio
+                    
+                    if logger:
+                        logger.debug(f"Resized image for Moondream: {original_size} -> {pil_image.size} (ratio: {ratio:.2f})")
+        
+        if logger:
+            logger.debug(f"Sending image to Moondream API: {pil_image.size[0]}x{pil_image.size[1]} pixels")
+        
+        # Convert PIL image to base64-encoded JPEG data URL format
+        buffer = BytesIO()
+        pil_image.save(buffer, format='JPEG', quality=85)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        # Moondream API requires data URL format (data:image/...)
+        image_url = f"data:image/jpeg;base64,{image_base64}"
+        
+        # Prepare headers
+        headers = {
+            'X-Moondream-Auth': api_key,
+            'Content-Type': 'application/json'
+        }
+        
+        # Directly detect "car" objects (no query step to minimize API calls)
+        if logger:
+            logger.debug("Calling Moondream Detect API for 'car'...")
+        
+        detect_response = requests.post(
+            "https://api.moondream.ai/v1/detect",
+            headers=headers,
+            json={
+                'image_url': image_url,
+                'object': 'car',
+                'reasoning': True  # Enable grounded reasoning for better accuracy
+            },
+            timeout=10
+        )
+        
+        if detect_response.status_code != 200:
+            if logger:
+                logger.warning(f"Moondream Detect API error: HTTP {detect_response.status_code} - falling back to YOLO: {detect_response.text}")
+            return None
+        
+        # Update last API call timestamp after successful API call
+        last_moondream_api_call_time = time.time()
+        
+        detect_result = detect_response.json()
+        
+        # Debug: log full response (will show when --debug is used)
+        if logger:
+            logger.debug(f"Moondream API response: {json.dumps(detect_result, indent=2)}")
+        
+        # Parse detection results
+        detections = []
+        objects = detect_result.get('objects', [])
+        
+        if not objects or len(objects) == 0:
+            if logger:
+                logger.debug("No cars detected in image")
+            return None
+        
+        # COCO class ID for car is 2
+        car_class_id = 2
+        
+        for obj in objects:
+            # Moondream returns normalized coordinates (0-1) relative to the image sent
+            # Since normalized coordinates are scale-independent (percentages), we can
+            # convert them directly to the original frame pixel coordinates
+            x_min_norm = float(obj.get('x_min', 0))
+            y_min_norm = float(obj.get('y_min', 0))
+            x_max_norm = float(obj.get('x_max', 0))
+            y_max_norm = float(obj.get('y_max', 0))
+            
+            # Convert normalized coordinates to pixel coordinates in original frame
+            # (normalized coords work regardless of resized image size)
+            x1 = int(x_min_norm * original_frame_width)
+            y1 = int(y_min_norm * original_frame_height)
+            x2 = int(x_max_norm * original_frame_width)
+            y2 = int(y_max_norm * original_frame_height)
+            
+            # Validate bounding box
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            detections.append({
+                'bbox': [x1, y1, x2, y2],  # Pixel coordinates
+                'class_id': car_class_id,
+                'confidence': 1.0,  # Moondream doesn't provide confidence scores
+                'class_name': 'car'
+            })
+        
+        if logger:
+            logger.debug(f"Moondream API detected {len(detections)} car(s)")
+        
+        return detections if detections else None
+        
+    except requests.exceptions.Timeout:
+        if logger:
+            logger.warning("Moondream API request timed out - falling back to YOLO")
+        return None
+    except requests.exceptions.RequestException as e:
+        if logger:
+            logger.warning(f"Moondream API request failed (network error) - falling back to YOLO: {e}")
+        return None
+    except Exception as e:
+        if logger:
+            logger.warning(f"Error processing Moondream API response - falling back to YOLO: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        return None
+
+# Determine detection engine from config
+detection_engine = config.get('DETECTION', 'engine', fallback='yolo').strip().lower()
+moondream_api_key = None
+
+# Always load YOLO model for fallback support (even when using Moondream)
 yolo_model = None
 yolo_version = None
-
-# Load YOLOv11 (best accuracy and efficiency)
 try:
     from ultralytics import YOLO
     # YOLOv11 will auto-download on first use if not present
-    # Using YOLOv11n (nano) for RPi - lowest CPU usage while maintaining good accuracy
+    # Using YOLOv11s for RPi - balanced accuracy and performance
     yolo_model = YOLO('yolo11s.pt')  # Will download if not found
     yolo_version = "YOLOv11"
-    log.info("YOLOv11 model loaded successfully")
+    log.info("YOLOv11 model loaded successfully (available for fallback)")
 except ImportError:
     log.error("ultralytics package not available. Please install it: pip install ultralytics")
     log.error("Exiting.")
@@ -1082,6 +1417,23 @@ except Exception as e:
     log.error(f"Failed to load YOLOv11 model: {e}")
     log.error("Exiting.")
     sys.exit(1)
+
+# Setup detection engine
+moondream_api_key = None
+if detection_engine == 'moondream':
+    # Use Moondream API (with YOLO fallback)
+    moondream_api_key = get_moondream_api_key()
+    if not moondream_api_key:
+        log.warning("Detection engine is set to 'moondream' but MOONDREAM_API_KEY environment variable is not set.")
+        log.warning("Falling back to YOLO. To use Moondream, set: export MOONDREAM_API_KEY='your-api-key'")
+        detection_engine = 'yolo'  # Fallback to YOLO
+    else:
+        log.info("Using Moondream API for object detection (with YOLO fallback)")
+elif detection_engine == 'yolo':
+    log.info("Using YOLO for object detection")
+else:
+    log.warning(f"Unknown detection engine '{detection_engine}', defaulting to 'yolo'")
+    detection_engine = 'yolo'
 
 # Check if using local file or RTSP stream
 use_local_file = get_config_bool(config, 'VIDEO', 'use_local_file', fallback=False)
@@ -1265,6 +1617,9 @@ last_frame_hash_time = None
 
 # Temporal smoothing for missed detections
 last_car_detection_time = None  # Timestamp of last successful car detection (initialized above)
+
+# Moondream API rate limiting and time window tracking
+last_moondream_api_call_time = None  # Timestamp of last Moondream API call
 try:
     import threading
     display_lock = threading.Lock()
@@ -1313,13 +1668,14 @@ def compute_frame_hash(frame):
         return None
 
 def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                         yolo_model, confidence_threshold, 
+                         detection_engine, yolo_model, moondream_api_key, confidence_threshold,
+                         config=None,
                          last_frame_hash=None, last_frame_detection_result=None,
                          last_car_detection_time=None, temporal_smoothing_window=3.0,
                          roi_point_x=None, roi_point_y=None, roi_quadrant=None):
-    """Process a frame with YOLO detection (runs in separate thread or at intervals)
+    """Process a frame with object detection (YOLO or Moondream API)
     
-    Detects objects in CAR_STATUS_TRIGGER_CLASSES (currently car and suitcase) in the frame or ROI.
+    Detects objects in CAR_STATUS_TRIGGER_CLASSES (currently car, truck, boat, suitcase) in the frame or ROI.
     Only these classes trigger the parking spot "occupied" status.
     
     Implements hybrid caching approach:
@@ -1330,7 +1686,9 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         frame: OpenCV frame (numpy array)
         use_full_frame: If True, use entire frame; if False, extract ROI first
         roi_x, roi_y, roi_w, roi_h: Region of Interest coordinates (only used if use_full_frame=False)
-        yolo_model: YOLOv11 model instance
+        detection_engine: Detection engine ('yolo' or 'moondream')
+        yolo_model: YOLOv11 model instance (None if using Moondream)
+        moondream_api_key: Moondream API key (None if using YOLO)
         confidence_threshold: Minimum confidence for detections (0.0-1.0)
         last_frame_hash: Hash of last processed frame (for caching)
         last_frame_detection_result: Cached (car_detected, detections, frame_size) tuple
@@ -1340,7 +1698,7 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
     Returns:
         Tuple of (car_detected, detections, frame_size, frame_hash):
         - car_detected: Boolean indicating if car/suitcase was detected
-        - detections: YOLO detection results (for bounding box overlay)
+        - detections: Detection results (YOLO or Moondream-compatible format for bounding box overlay)
         - frame_size: (width, height) tuple of the detection region
         - frame_hash: Hash of processed frame for next comparison
     """
@@ -1397,27 +1755,102 @@ def process_cv_detection(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         car_detected = False
         detections = None
         
-        # YOLO detection (COCO classes)
-        # Check for classes defined in CAR_STATUS_TRIGGER_CLASSES for parking spot occupancy
-        if yolo_model is not None:
-            # Run YOLO detection (imgsz auto-detected from frame size for optimal performance)
-            results = yolo_model(detection_frame, conf=confidence_threshold, verbose=False)
-            detections = results
+        # Run detection based on selected engine
+        use_yolo_fallback = False
+        
+        if detection_engine == 'moondream':
+            # Moondream API detection (config passed for rate limiting and time window)
+            moondream_detections = detect_with_moondream_api(
+                detection_frame, 
+                moondream_api_key, 
+                confidence_threshold,
+                config=config,
+                logger=log
+            )
             
-            # Check for classes that trigger parking spot occupancy (early exit for performance)
-            for result in results:
-                boxes = result.boxes
-                if len(boxes) > 0:
-                    # Convert to numpy once for better performance
-                    if hasattr(boxes.cls, 'cpu'):
-                        class_ids = boxes.cls.cpu().numpy()
-                    else:
-                        class_ids = boxes.cls.numpy()
-                    
-                    # Check if any detected class is in trigger classes (vectorized check)
-                    if any(int(cid) in CAR_STATUS_TRIGGER_CLASSES for cid in class_ids):
+            if moondream_detections:
+                # Convert Moondream detections to YOLO-compatible format
+                # Filter for trigger classes and check if any are present
+                trigger_detections = []
+                for det in moondream_detections:
+                    class_id = det['class_id']
+                    if class_id in CAR_STATUS_TRIGGER_CLASSES:
                         car_detected = True
-                        break
+                        trigger_detections.append(det)
+                
+                # Create wrapper for compatibility with overlay_bounding_boxes
+                if moondream_detections:
+                    detections = create_moondream_detection_wrapper(
+                        moondream_detections, frame_w, frame_h
+                    )
+            else:
+                # Moondream failed/not available (time window, rate limit, or API error) - fallback to YOLO
+                use_yolo_fallback = True
+                if log:
+                    log.debug("Moondream API unavailable, falling back to YOLO")
+        
+        # Use YOLO if explicitly selected OR if Moondream fallback is needed
+        if detection_engine != 'moondream' or use_yolo_fallback:
+            # YOLO detection (COCO classes)
+            # Check for classes defined in CAR_STATUS_TRIGGER_CLASSES for parking spot occupancy
+            if yolo_model is not None:
+                # Run YOLO detection (imgsz auto-detected from frame size for optimal performance)
+                results = yolo_model(detection_frame, conf=confidence_threshold, verbose=False)
+                detections = results
+                
+                # Collect all detections for debug logging
+                all_detections = []
+                
+                # Check for classes that trigger parking spot occupancy (early exit for performance)
+                for result in results:
+                    boxes = result.boxes
+                    if len(boxes) > 0:
+                        # Get class names from result object if available
+                        result_class_names = None
+                        if hasattr(result, 'names') and result.names:
+                            result_class_names = result.names
+                        
+                        # Convert to numpy once for better performance
+                        if hasattr(boxes.cls, 'cpu'):
+                            class_ids = boxes.cls.cpu().numpy()
+                            confidences = boxes.conf.cpu().numpy()
+                        else:
+                            class_ids = boxes.cls.numpy()
+                            confidences = boxes.conf.numpy()
+                        
+                        # Collect detections for debug logging
+                        for i in range(len(boxes)):
+                            class_id = int(class_ids[i])
+                            confidence = float(confidences[i])
+                            
+                            # Get class name
+                            if result_class_names and class_id in result_class_names:
+                                class_name = result_class_names[class_id]
+                            elif result_class_names and isinstance(result_class_names, (list, tuple)) and class_id < len(result_class_names):
+                                class_name = result_class_names[class_id]
+                            else:
+                                class_name = f"Class_{class_id}"
+                            
+                            all_detections.append({
+                                'class_id': class_id,
+                                'class_name': class_name,
+                                'confidence': confidence
+                            })
+                        
+                        # Check if any detected class is in trigger classes (vectorized check)
+                        if any(int(cid) in CAR_STATUS_TRIGGER_CLASSES for cid in class_ids):
+                            car_detected = True
+                            break
+                
+                # Debug: log all YOLO detections (will show when --debug is used)
+                if all_detections:
+                    detection_summary = ", ".join([
+                        f"{det['class_name']} ({det['class_id']}): {det['confidence']:.2f}"
+                        for det in all_detections
+                    ])
+                    log.debug(f"YOLO detections: {detection_summary}")
+                else:
+                    log.debug("YOLO detections: none")
         
         # HYBRID APPROACH #2: Temporal smoothing - if detection failed but car was detected recently, keep it
         if not car_detected and last_car_detection_time is not None:
@@ -1505,12 +1938,12 @@ def prepare_display_image(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h, con
             return create_placeholder_image(roi_w, roi_h, config)
 
 def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                        yolo_model, confidence_threshold,
+                        detection_engine, yolo_model, moondream_api_key, confidence_threshold,
                         car_history, history_size, car_present_threshold, car_absent_threshold,
                         roi_point_x=None, roi_point_y=None, roi_quadrant=None):
     """Background thread function for CV processing
     
-    Runs YOLO detection on a frame and updates shared state:
+    Runs object detection (YOLO or Moondream) on a frame and updates shared state:
     - latest_detections: Detection results for bounding box overlay
     - latest_detection_frame_size: Size of the detection region
     - car_history: History buffer of car detection results (thread-safe)
@@ -1537,7 +1970,8 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
         
         car_detected, detections, frame_size, frame_hash = process_cv_detection(
             frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-            yolo_model, confidence_threshold,
+            detection_engine, yolo_model, moondream_api_key, confidence_threshold,
+            config=config,
             last_frame_hash=current_last_hash,
             last_frame_detection_result=current_last_result,
             last_car_detection_time=current_last_detection_time,
@@ -1646,7 +2080,8 @@ if args.save_frame:
                     # In save-frame mode, we don't use caching (fresh detection every time)
                     car_detected, detections, frame_size, _ = process_cv_detection(
                         frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                        yolo_model, confidence_threshold,
+                        detection_engine, yolo_model, moondream_api_key, confidence_threshold,
+                        config=config,
                         last_frame_hash=None,
                         last_frame_detection_result=None,
                         last_car_detection_time=None,
@@ -1821,7 +2256,7 @@ try:
             thread = threading.Thread(
                 target=cv_processing_thread,
                 args=(frame.copy(), use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                      yolo_model, confidence_threshold,
+                      detection_engine, yolo_model, moondream_api_key, confidence_threshold,
                       car_history, history_size, car_present_threshold, car_absent_threshold,
                       roi_point_x, roi_point_y, roi_quadrant),
                 daemon=True
@@ -1844,7 +2279,8 @@ try:
             
             car_detected, detections, frame_size, frame_hash = process_cv_detection(
                 frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
-                yolo_model, confidence_threshold,
+                detection_engine, yolo_model, moondream_api_key, confidence_threshold,
+                config=config,
                 last_frame_hash=current_last_hash,
                 last_frame_detection_result=current_last_result,
                 last_car_detection_time=current_last_detection_time,
