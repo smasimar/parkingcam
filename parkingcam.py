@@ -384,9 +384,9 @@ def build_display_canvas(car_image, car_history, config, sensor=None, display_wi
             
             # Position below clock
             y_offset = video_start_y
-
-        # Paste the processed image (full screen)
-        canvas.paste(car_image, (x_offset, y_offset))
+            
+            # Paste the processed image (only when not a placeholder)
+            canvas.paste(car_image, (x_offset, y_offset))
 
         draw = ImageDraw.Draw(canvas)
         # Draw status bar if enabled
