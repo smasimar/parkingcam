@@ -706,15 +706,32 @@ def display_exit(disp):
 # Common functionality
 ####################################################################################################
 
-# Global flag for graceful shutdown
-shutdown_flag = False
+# Global flag for graceful shutdown - use threading.Event for thread-safe coordination
+try:
+    import threading
+    shutdown_event = threading.Event()
+    HAS_SHUTDOWN_EVENT = True
+except ImportError:
+    shutdown_event = None
+    HAS_SHUTDOWN_EVENT = False
+    shutdown_flag = False  # Fallback for non-threading environments
 
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
-    global shutdown_flag
     log.info("Shutdown signal received. Cleaning up...")
-    shutdown_flag = True
+    if HAS_SHUTDOWN_EVENT:
+        shutdown_event.set()
+    else:
+        global shutdown_flag
+        shutdown_flag = True
 
+def is_shutdown():
+    """Check if shutdown has been requested (thread-safe)"""
+    if HAS_SHUTDOWN_EVENT:
+        return shutdown_event.is_set()
+    else:
+        global shutdown_flag
+        return shutdown_flag
 
 def draw_statusbar(car_history, debug_image, config, display, sensor, rtsp_reconnect_info=None, log_status=False):
     """Draw status bar on display and optionally log status to console
@@ -981,60 +998,113 @@ def rtsp_reconnection_thread(rtsp_url, rtsp_timeout, rtsp_cap_lock, rtsp_cap_ref
         rtsp_cap_ref: Reference to the RTSP VideoCapture object (list with single element)
         rtsp_reconnect_info: Thread-safe reference to reconnection info dict (list with single dict)
     """
-    global shutdown_flag
     reconnect_interval = 5  # Wait 5 seconds between reconnection attempts
     log.info("RTSP reconnection thread started")
     
-    while not shutdown_flag:
-        try:
-            # Check if we need to reconnect
-            with rtsp_cap_lock:
-                current_cap = rtsp_cap_ref[0]
-            
-            if current_cap is None or not current_cap.isOpened():
-                # Update reconnection info
+    # Use shutdown_event if available, otherwise fallback to shutdown_flag
+    if HAS_SHUTDOWN_EVENT:
+        while not shutdown_event.is_set():
+            try:
+                # Check if we need to reconnect
                 with rtsp_cap_lock:
-                    info = rtsp_reconnect_info[0]
-                    info['attempt_count'] = info.get('attempt_count', 0) + 1
-                    info['last_attempt_time'] = time.time()
-                    info['status'] = 'attempting'
+                    current_cap = rtsp_cap_ref[0]
                 
-                # Attempt to reconnect
-                log.info(f"Attempting to reconnect to RTSP stream (attempt {info['attempt_count']})...")
-                new_cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
-                
-                if new_cap is not None and new_cap.isOpened():
-                    # Successfully reconnected
+                if current_cap is None or not current_cap.isOpened():
+                    # Update reconnection info
                     with rtsp_cap_lock:
-                        # Release old cap if it exists
-                        if rtsp_cap_ref[0] is not None:
-                            try:
-                                rtsp_cap_ref[0].release()
-                            except:
-                                pass
-                        rtsp_cap_ref[0] = new_cap
-                        # Reset reconnection info on success
-                        rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
-                    # Reset ROI cache since video resolution may have changed
-                    reset_roi_cache()
-                    log.info("RTSP stream reconnected successfully")
+                        info = rtsp_reconnect_info[0]
+                        info['attempt_count'] = info.get('attempt_count', 0) + 1
+                        info['last_attempt_time'] = time.time()
+                        info['status'] = 'attempting'
+                    
+                    # Attempt to reconnect
+                    log.info(f"Attempting to reconnect to RTSP stream (attempt {info['attempt_count']})...")
+                    new_cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
+                    
+                    if new_cap is not None and new_cap.isOpened():
+                        # Successfully reconnected
+                        with rtsp_cap_lock:
+                            # Release old cap if it exists
+                            if rtsp_cap_ref[0] is not None:
+                                try:
+                                    rtsp_cap_ref[0].release()
+                                except Exception as e:
+                                    log.debug(f"Error releasing old RTSP cap: {e}")
+                            rtsp_cap_ref[0] = new_cap
+                            # Reset reconnection info on success
+                            rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+                        # Reset ROI cache since video resolution may have changed
+                        reset_roi_cache()
+                        log.info("RTSP stream reconnected successfully")
+                    else:
+                        # Reconnection failed, will try again after interval
+                        with rtsp_cap_lock:
+                            rtsp_reconnect_info[0]['status'] = 'failed'
+                        log.debug(f"RTSP reconnection failed, will retry in {reconnect_interval} seconds")
                 else:
-                    # Reconnection failed, will try again after interval
+                    # Stream is connected, update status
                     with rtsp_cap_lock:
-                        rtsp_reconnect_info[0]['status'] = 'failed'
-                    log.debug(f"RTSP reconnection failed, will retry in {reconnect_interval} seconds")
-            else:
-                # Stream is connected, update status
+                        rtsp_reconnect_info[0]['status'] = 'connected'
+                    pass
+                
+                # Wait before next check
+                time.sleep(reconnect_interval)
+                
+            except Exception as e:
+                log.error(f"Error in RTSP reconnection thread: {e}")
+                time.sleep(reconnect_interval)
+    else:
+        global shutdown_flag
+        while not shutdown_flag:
+            try:
+                # Check if we need to reconnect
                 with rtsp_cap_lock:
-                    rtsp_reconnect_info[0]['status'] = 'connected'
-                pass
-            
-            # Wait before next check
-            time.sleep(reconnect_interval)
-            
-        except Exception as e:
-            log.error(f"Error in RTSP reconnection thread: {e}")
-            time.sleep(reconnect_interval)
+                    current_cap = rtsp_cap_ref[0]
+                
+                if current_cap is None or not current_cap.isOpened():
+                    # Update reconnection info
+                    with rtsp_cap_lock:
+                        info = rtsp_reconnect_info[0]
+                        info['attempt_count'] = info.get('attempt_count', 0) + 1
+                        info['last_attempt_time'] = time.time()
+                        info['status'] = 'attempting'
+                    
+                    # Attempt to reconnect
+                    log.info(f"Attempting to reconnect to RTSP stream (attempt {info['attempt_count']})...")
+                    new_cap = connect_to_rtsp_stream(rtsp_url, timeout_seconds=rtsp_timeout)
+                    
+                    if new_cap is not None and new_cap.isOpened():
+                        # Successfully reconnected
+                        with rtsp_cap_lock:
+                            # Release old cap if it exists
+                            if rtsp_cap_ref[0] is not None:
+                                try:
+                                    rtsp_cap_ref[0].release()
+                                except Exception as e:
+                                    log.debug(f"Error releasing old RTSP cap: {e}")
+                            rtsp_cap_ref[0] = new_cap
+                            # Reset reconnection info on success
+                            rtsp_reconnect_info[0] = {'attempt_count': 0, 'last_attempt_time': None, 'status': 'connected'}
+                        # Reset ROI cache since video resolution may have changed
+                        reset_roi_cache()
+                        log.info("RTSP stream reconnected successfully")
+                    else:
+                        # Reconnection failed, will try again after interval
+                        with rtsp_cap_lock:
+                            rtsp_reconnect_info[0]['status'] = 'failed'
+                        log.debug(f"RTSP reconnection failed, will retry in {reconnect_interval} seconds")
+                else:
+                    # Stream is connected, update status
+                    with rtsp_cap_lock:
+                        rtsp_reconnect_info[0]['status'] = 'connected'
+                    pass
+                
+                # Wait before next check
+                time.sleep(reconnect_interval)
+                
+            except Exception as e:
+                log.error(f"Error in RTSP reconnection thread: {e}")
+                time.sleep(reconnect_interval)
     
     log.info("RTSP reconnection thread stopped")
 
@@ -2198,7 +2268,12 @@ def cv_processing_thread(frame, use_full_frame, roi_x, roi_y, roi_w, roi_h,
     except Exception as e:
         log.error(f"Error in CV processing thread: {e}")
     finally:
-        cv_processing = False
+        # Thread-safe update of cv_processing flag
+        if display_lock:
+            with display_lock:
+                cv_processing = False
+        else:
+            cv_processing = False
 
 # If save-frame mode, capture frame(s) and exit (no display hardware needed)
 if args.save_frame:
@@ -2340,7 +2415,7 @@ if args.save_frame:
 log.info("Starting parking spot monitoring...")
 
 try:
-    while not shutdown_flag:
+    while not is_shutdown():
         # Handle video source (RTSP stream or local file)
         if use_local_file:
             # Local file mode
@@ -2373,53 +2448,70 @@ try:
                         continue
         elif rtsp_url is not None:
             # RTSP stream mode - use thread-safe shared cap
-            # Get current cap from shared reference (background thread may have reconnected)
+            # Hold lock during entire read operation to prevent race condition with reconnection thread
             if rtsp_cap_lock is not None:
                 with rtsp_cap_lock:
                     cap = rtsp_cap_ref[0]
-            else:
-                cap = rtsp_cap_ref[0]
-            
-            # If the stream is not connected, show placeholder and continue (reconnection happens in background)
-            if cap is None or not cap.isOpened():
-                frame = None
-                ret = False
-                # Continue to display update (will show placeholder)
-            else:
-                # Suppress FFmpeg stderr during frame reading to avoid H.264 decoding error spam
-                # These errors are non-fatal and occur with packet loss/corruption
-                try:
-                    with suppress_stderr():
-                        ret, frame = cap.read()
-                except Exception as e:
-                    log.error(f"Error reading frame (decoding error?): {e}")
-                    ret = False
-                    frame = None
-                
-                # If frame is not grabbed, mark as failed (background thread will handle reconnection)
-                if not ret:
-                    log.debug("Failed to read frame from RTSP stream (background thread will handle reconnection)")
-                    frame = None
-                    ret = False
-                    # Check if cap is still valid, if not, clear it
-                    if cap is not None:
+                    # If the stream is not connected, show placeholder and continue (reconnection happens in background)
+                    if cap is None or not cap.isOpened():
+                        frame = None
+                        ret = False
+                    else:
+                        # Suppress FFmpeg stderr during frame reading to avoid H.264 decoding error spam
+                        # These errors are non-fatal and occur with packet loss/corruption
                         try:
-                            if not cap.isOpened():
-                                # Cap is closed, clear reference so background thread knows to reconnect
-                                if rtsp_cap_lock is not None:
-                                    with rtsp_cap_lock:
+                            with suppress_stderr():
+                                ret, frame = cap.read()
+                        except Exception as e:
+                            log.error(f"Error reading frame (decoding error?): {e}")
+                            ret = False
+                            frame = None
+                        
+                        # If frame is not grabbed, mark as failed (background thread will handle reconnection)
+                        if not ret:
+                            log.debug("Failed to read frame from RTSP stream (background thread will handle reconnection)")
+                            frame = None
+                            ret = False
+                            # Check if cap is still valid, if not, clear it
+                            if cap is not None:
+                                try:
+                                    if not cap.isOpened():
+                                        # Cap is closed, clear reference so background thread knows to reconnect
                                         rtsp_cap_ref[0] = None
-                                else:
+                                        cap = None
+                                except Exception as e:
+                                    # Cap may be in invalid state, clear it
+                                    log.debug(f"Error checking cap state: {e}")
                                     rtsp_cap_ref[0] = None
-                                cap = None
-                        except:
-                            # Cap may be in invalid state, clear it
-                            if rtsp_cap_lock is not None:
-                                with rtsp_cap_lock:
+                                    cap = None
+            else:
+                # No lock available (threading disabled) - use original logic
+                cap = rtsp_cap_ref[0]
+                if cap is None or not cap.isOpened():
+                    frame = None
+                    ret = False
+                else:
+                    try:
+                        with suppress_stderr():
+                            ret, frame = cap.read()
+                    except Exception as e:
+                        log.error(f"Error reading frame (decoding error?): {e}")
+                        ret = False
+                        frame = None
+                    
+                    if not ret:
+                        log.debug("Failed to read frame from RTSP stream")
+                        frame = None
+                        ret = False
+                        if cap is not None:
+                            try:
+                                if not cap.isOpened():
                                     rtsp_cap_ref[0] = None
-                            else:
+                                    cap = None
+                            except Exception as e:
+                                log.debug(f"Error checking cap state: {e}")
                                 rtsp_cap_ref[0] = None
-                            cap = None
+                                cap = None
         else:
             # No video source - create placeholder
             frame = None
@@ -2428,13 +2520,20 @@ try:
         # Get the current time
         current_time = time.time()
 
-        # Check if CV should run (at configured interval)
-        cv_should_run = (current_time - last_cv_time >= cv_interval) and not cv_processing
+        # Check if CV should run (at configured interval) - thread-safe check
+        if display_lock:
+            with display_lock:
+                cv_should_run = (current_time - last_cv_time >= cv_interval) and not cv_processing
+                if cv_should_run and frame is not None and ret and HAS_THREADING:
+                    cv_processing = True
+        else:
+            cv_should_run = (current_time - last_cv_time >= cv_interval) and not cv_processing
+            if cv_should_run and frame is not None and ret and HAS_THREADING:
+                cv_processing = True
         
         # Start CV processing thread if it's time and we have a frame
         if cv_should_run and frame is not None and ret and HAS_THREADING:
             last_cv_time = current_time
-            cv_processing = True
             # Start CV processing in background thread (non-blocking)
             thread = threading.Thread(
                 target=cv_processing_thread,
@@ -2604,14 +2703,14 @@ finally:
             if rtsp_cap_ref[0] is not None:
                 try:
                     rtsp_cap_ref[0].release()
-                except:
-                    pass
+                except Exception as e:
+                    log.debug(f"Error releasing RTSP cap in cleanup: {e}")
                 rtsp_cap_ref[0] = None
     elif rtsp_cap_ref is not None and rtsp_cap_ref[0] is not None:
         try:
             rtsp_cap_ref[0].release()
-        except:
-            pass
+        except Exception as e:
+            log.debug(f"Error releasing RTSP cap in cleanup: {e}")
         rtsp_cap_ref[0] = None
     # Also release local cap if it exists (for local file mode)
     if cap is not None:
